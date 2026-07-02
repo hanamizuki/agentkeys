@@ -24,39 +24,40 @@ age-keygen -o "$FAKE_HOME/.age/key.txt" 2>/dev/null
 chmod 600 "$FAKE_HOME/.age/key.txt"
 
 # 2. Init vault
-bash "$REPO/agentkeys" init "$VAULT" >/dev/null 2>&1
+bash "$REPO/agentkeys" init "$VAULT" >/dev/null
 
 # 3. Add recipient
-AGENTKEYS_KEYVAULT="$VAULT" bash "$REPO/agentkeys" add-recipient test-machine >/dev/null 2>&1
+AGENTKEYS_KEYVAULT="$VAULT" bash "$REPO/agentkeys" add-recipient test-machine >/dev/null
 
 # 4. Create and encrypt a secret (must cd into vault so sops finds .sops.yaml)
 (
   cd "$VAULT"
   echo '{"API_KEY": "sk-test-roundtrip", "OTHER_KEY": "value-two"}' > shared/test.yaml
-  sops -e -i shared/test.yaml 2>/dev/null
+  sops -e -i shared/test.yaml
   git add shared/test.yaml && git commit -q -m "add test secret"
 )
 
 # 5. Sync
 SECRETS="$FAKE_HOME/.secrets"
-AGENTKEYS_KEYVAULT="$VAULT" bash "$REPO/agentkeys" sync --no-pull --secrets-dir "$SECRETS" >/dev/null 2>&1
+AGENTKEYS_KEYVAULT="$VAULT" bash "$REPO/agentkeys" sync --no-pull --secrets-dir "$SECRETS" >/dev/null
 
 # 6. Verify
 assert_eq() { [ "$2" = "$3" ] || { echo "FAIL: $1 — expected '$3', got '$2'"; exit 1; }; }
 
-# .env file exists and contains the keys
-assert_eq "shared env exists" "$(test -f "$SECRETS/shared/test.env" && echo yes)" "yes"
-assert_eq "API_KEY value" "$(grep '^API_KEY=' "$SECRETS/shared/test.env" | sed "s/^API_KEY=//;s/^'//;s/'$//")" "sk-test-roundtrip"
-assert_eq "OTHER_KEY value" "$(grep '^OTHER_KEY=' "$SECRETS/shared/test.env" | sed "s/^OTHER_KEY=//;s/^'//;s/'$//")" "value-two"
+# .env file exists — source it to verify values (same as how consumers use it)
+[ -f "$SECRETS/shared/test.env" ] || { echo "FAIL: shared env file not found"; exit 1; }
+source "$SECRETS/shared/test.env"
+assert_eq "API_KEY value" "$API_KEY" "sk-test-roundtrip"
+assert_eq "OTHER_KEY value" "$OTHER_KEY" "value-two"
 
 # .sync-state exists and is valid JSON with status ok
-assert_eq "sync-state exists" "$(test -f "$SECRETS/.sync-state" && echo yes)" "yes"
+[ -f "$SECRETS/.sync-state" ] || { echo "FAIL: .sync-state not found"; exit 1; }
 assert_eq "sync status" "$(jq -r .status "$SECRETS/.sync-state")" "ok"
 assert_eq "files written" "$(jq -r .files_written "$SECRETS/.sync-state")" "1"
 
 # status command works
 STATUS_EXIT=0
-AGENTKEYS_KEYVAULT="$VAULT" bash "$REPO/agentkeys" status --secrets-dir "$SECRETS" --json >/dev/null 2>&1 || STATUS_EXIT=$?
+AGENTKEYS_KEYVAULT="$VAULT" bash "$REPO/agentkeys" status --secrets-dir "$SECRETS" --json >/dev/null || STATUS_EXIT=$?
 assert_eq "status exit code" "$STATUS_EXIT" "0"
 
 echo "PASS: roundtrip test"
