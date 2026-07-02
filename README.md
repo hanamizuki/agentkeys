@@ -108,7 +108,7 @@ brew install sops age jq yq
 ### Install
 
 ```bash
-git clone https://github.com/<TBD>/agentkeys.git
+git clone https://github.com/hanamizuki/agentkeys.git
 cd agentkeys
 bash install.sh
 ```

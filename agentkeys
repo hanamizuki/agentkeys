@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # agentkeys — secret orchestration CLI for cross-machine cron/daemon/AI agent
-# https://github.com/<TBD>/agentkeys
+# https://github.com/hanamizuki/agentkeys
 set -euo pipefail
 
 # --- Bash 4+ guard ---
