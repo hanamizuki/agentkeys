@@ -524,18 +524,18 @@ Three blocks:
 |---|---|---|
 | **Data** | sops-encrypted git repo + CLI scripts | Source of truth |
 | **Sync daemon** | launchd / systemd timer running `sync.sh` | Background pull + decrypt |
-| **Ops CLI** | `keyvault` command | Interactive ops (rotate, edit, status, emergency) |
+| **Ops CLI** | `agentkeys` command | Interactive ops (rotate, edit, status, emergency) |
 
 ### CLI surface
 
 ```
-keyvault sync                # Pull + decrypt now
-keyvault status              # Show stale machines, last sync times, errors
-keyvault edit <path>         # Wrap sops edit + commit + push
-keyvault rotate <KEY_NAME>   # Locate, edit, push, sync, reload, audit log
-keyvault add-file <src> <dest>  # Encrypt a file into manifest
-keyvault add-recipient <machine> <pubkey>   # Register new machine
-keyvault emergency-revoke <machine>          # Remove machine, re-encrypt, rotate
+agentkeys sync                # Pull + decrypt now
+agentkeys status              # Show stale machines, last sync times, errors
+agentkeys edit <path>         # Wrap sops edit + commit + push
+agentkeys rotate <KEY_NAME>   # Locate, edit, push, sync, reload, audit log
+agentkeys add-file <src> <dest>  # Encrypt a file into manifest (planned)
+agentkeys add-recipient <machine> <pubkey>   # Register new machine
+agentkeys emergency-revoke <machine>          # Remove machine, re-encrypt, rotate (planned)
 ```
 
 ### `.sync-state` schema
