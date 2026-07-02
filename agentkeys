@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# agentkeys — secret orchestration CLI for cross-machine cron/daemon/AI agent
+# https://github.com/<TBD>/agentkeys
+set -euo pipefail
+
+# --- Bash 4+ guard ---
+# The subcommands use associative arrays (declare -A) and mapfile, neither of
+# which exist in macOS's bundled /bin/bash 3.2. cron / launchd typically have
+# a minimal PATH (/usr/bin:/bin) where `env bash` resolves to /bin/bash, so
+# even the shebang above is no guarantee. Detect, then re-exec under a
+# locatable bash 4+ instead of failing deep inside a subcommand.
+if [ -z "${AGENTKEYS_BASH_4_OK:-}" ]; then
+  if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ]; then
+    for _candidate in /opt/homebrew/bin/bash /usr/local/bin/bash /opt/local/bin/bash /usr/bin/bash; do
+      if [ -x "$_candidate" ]; then
+        _ver="$("$_candidate" -c 'echo "${BASH_VERSINFO[0]}"' 2>/dev/null || echo 0)"
+        if [ "$_ver" -ge 4 ] 2>/dev/null; then
+          export AGENTKEYS_BASH_4_OK=1
+          exec "$_candidate" "$0" "$@"
+        fi
+      fi
+    done
+    echo "agentkeys: requires bash 4+ (running under ${BASH_VERSION:-unknown})" >&2
+    echo "Install:   brew install bash    (then ensure /opt/homebrew/bin is on PATH)" >&2
+    exit 1
+  fi
+  export AGENTKEYS_BASH_4_OK=1
+fi
+
+# Resolve the agentkeys install dir (works for symlinks too)
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+AGENTKEYS_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+export AGENTKEYS_DIR
+SCRIPTS_DIR="$AGENTKEYS_DIR/scripts"
+LIB_DIR="$SCRIPTS_DIR/lib"
+export AGENTKEYS_LIB_DIR="$LIB_DIR"
+
+VERSION="0.1.0-alpha"
+
+usage() {
+  cat <<EOF
+agentkeys $VERSION — secret orchestration for cross-machine cron/daemon/AI agent
+
+USAGE:
+  agentkeys <command> [args...]
+
+COMMANDS:
+  init <path>                       Initialize a new keyvault repo
+  add-recipient <name> [pubkey]     Register a machine's age pubkey
+  edit <path>                       sops-edit a file in keyvault
+  sync                              Pull + decrypt to ~/.secrets/
+  status                            Show stale state, last sync, errors
+  rotate <KEY_NAME>                 Rotate a secret end-to-end (interactive)
+  version                           Print version
+  help                              Show this help
+
+EXAMPLES:
+  agentkeys init ~/my-vault
+  agentkeys add-recipient laptop
+  agentkeys edit shared/model-providers
+  agentkeys sync
+  agentkeys status
+
+ENV:
+  AGENTKEYS_KEYVAULT   Override keyvault repo location (default: auto-detect)
+  AGE_KEY_FILE         Override age key location (default: ~/.age/key.txt)
+
+DEPENDENCIES:
+  sops, age, git, jq, yq
+EOF
+}
+
+cmd="${1:-help}"
+[ $# -gt 0 ] && shift
+
+# Subcommand dispatch — use "$BASH" (path to the bash 4+ binary the guard
+# above settled on) instead of bare `bash`, so child invocations from cron /
+# launchd don't fall back to /bin/bash 3.2 via a minimal PATH.
+case "$cmd" in
+  init)          exec "$BASH" "$SCRIPTS_DIR/cmd-init.sh" "$@" ;;
+  add-recipient) exec "$BASH" "$SCRIPTS_DIR/cmd-add-recipient.sh" "$@" ;;
+  edit)          exec "$BASH" "$SCRIPTS_DIR/cmd-edit.sh" "$@" ;;
+  sync)          exec "$BASH" "$SCRIPTS_DIR/cmd-sync.sh" "$@" ;;
+  status)        exec "$BASH" "$SCRIPTS_DIR/cmd-status.sh" "$@" ;;
+  rotate)        exec "$BASH" "$SCRIPTS_DIR/cmd-rotate.sh" "$@" ;;
+  version|--version|-v) echo "agentkeys $VERSION" ;;
+  help|--help|-h) usage ;;
+  *)
+    echo "Unknown command: $cmd" >&2
+    echo "" >&2
+    usage >&2
+    exit 1
+    ;;
+esac
