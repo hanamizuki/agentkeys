@@ -22,6 +22,8 @@ VAULT="$FAKE_HOME/test-vault"
 mkdir -p "$FAKE_HOME/.age"
 age-keygen -o "$FAKE_HOME/.age/key.txt" 2>/dev/null
 chmod 600 "$FAKE_HOME/.age/key.txt"
+export AGE_KEY_FILE="$FAKE_HOME/.age/key.txt"
+unset SOPS_AGE_KEY_FILE 2>/dev/null || true
 
 # 2. Init vault
 bash "$REPO/agentkeys" init "$VAULT" >/dev/null
