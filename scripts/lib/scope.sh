@@ -151,4 +151,21 @@ HDR
     printf "  - path_regex: '^(%s)\$'\n" "${OTHER_GROUP[$key]}"
     printf "    age: %s\n" "$key"
   done < <(printf '%s\n' "${!OTHER_GROUP[@]}" | LC_ALL=C sort)
+
+  # Fallback rules so a NEW file (not yet in any exact rule) is still
+  # encryptable — granted to the "all"-scope machines only; scoped machines
+  # stay fail-closed on files they were not explicitly given. The files/
+  # fallback carries encrypted_regex and must precede the generic one (sops
+  # uses the first matching rule). Exact rules above always win for existing
+  # files; these only catch newly added ones until the next scope regen.
+  local -a all_pubs=(); local m mscope
+  for m in "${machines[@]}"; do
+    mscope="$(printf '%s' "$mj" | jq -r --arg m "$m" '.recipients[$m] // "all"')"
+    [ "$mscope" = "all" ] && all_pubs+=("${PUB[$m]}")
+  done
+  if [ ${#all_pubs[@]} -gt 0 ]; then
+    local all_csv; all_csv="$(printf '%s\n' "${all_pubs[@]}" | LC_ALL=C sort | paste -sd, -)"
+    printf "  - path_regex: '%s'\n    encrypted_regex: '%s'\n    age: %s\n" '^files/.*\.yaml$' '^(content)$' "$all_csv"
+    printf "  - path_regex: '%s'\n    age: %s\n" '\.yaml$' "$all_csv"
+  fi
 }

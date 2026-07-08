@@ -88,6 +88,23 @@ if AGENTKEYS_KEYVAULT="$VAULT" bash "$REPO/agentkeys" scope show nonesuch >/dev/
   echo "FAIL: scope show should reject unknown machine"; fail=1
 fi
 
+# --- review fix (Finding B): a NEW file is still encryptable via fallback ---
+# manifest here is core=all, edge=[boba]; fallback grants "all" machines (core).
+emit_sops_rules "$VAULT" > "$VAULT/.sops.yaml"
+sops_yaml="$(cat "$VAULT/.sops.yaml")"
+has "generic fallback rule" "$sops_yaml" "path_regex: '\\.yaml\$'"
+has "files fallback rule"   "$sops_yaml" "path_regex: '^files/.*\\.yaml\$'"
+echo '{"NEW":"v"}' > "$VAULT/shared/brandnew.yaml"   # not in any exact rule
+if (cd "$VAULT" && SOPS_AGE_KEY_FILE="$FIXTURE_HOME/keys/core.txt" sops -e -i shared/brandnew.yaml 2>/dev/null); then
+  : # encrypted via fallback — good
+else
+  echo "FAIL: new file should encrypt via fallback rule"; fail=1
+fi
+# edge (scoped away) must NOT be able to decrypt the new file
+[ "$(SOPS_AGE_KEY_FILE="$FIXTURE_HOME/keys/edge.txt" sops -d "$VAULT/shared/brandnew.yaml" >/dev/null 2>&1 && echo OK || echo DENIED)" = "DENIED" ] \
+  || { echo "FAIL: scoped machine should be fail-closed on new file"; fail=1; }
+rm -f "$VAULT/shared/brandnew.yaml"
+
 # --- review fix (Finding 3): emit fails clearly on a zero-recipient file ---
 # Scope BOTH machines to boba only; mojo/model/certs become undecryptable.
 cat > "$VAULT/$SCOPES_FILE_NAME" <<YAML

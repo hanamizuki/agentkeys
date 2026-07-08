@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # agentkeys scope <show|set|regen>
 # show  — print each machine's scope, or one machine's decryptable files.
-# set   — change a machine's scope + regenerate .sops.yaml + updatekeys  (later change)
-# regen — regenerate .sops.yaml from the manifest + updatekeys           (later change)
+# set   — change a machine's scope + regenerate .sops.yaml + sops updatekeys.
+# regen — regenerate .sops.yaml from the manifest + sops updatekeys.
+#
+# set/regen run `sops updatekeys`, which must decrypt each file first — run
+# them on a machine whose age key can decrypt everything (a full-scope machine).
 set -euo pipefail
 
 source "${AGENTKEYS_LIB_DIR:-$(dirname "${BASH_SOURCE[0]}")/lib}/common.sh"
@@ -30,6 +33,43 @@ esac
 
 check_deps
 keyvault="$(find_keyvault_root)" || die "Not inside a keyvault repo"
+cd "$keyvault"   # sops updatekeys resolves .sops.yaml from cwd
+
+# Seed the manifest from current recipients (all-"all") if it's absent, so a
+# pre-scope vault upgrades smoothly the first time scope is mutated.
+_scope_ensure_manifest() {
+  [ -f "$keyvault/$SCOPES_FILE_NAME" ] && return
+  scope_load_manifest "$keyvault" | yq -P '.' > "$keyvault/$SCOPES_FILE_NAME"
+  info "Seeded $SCOPES_FILE_NAME (all recipients = all)"
+}
+
+# Regenerate .sops.yaml (atomic + guarded), warn on any <3-recipient rule,
+# re-encrypt every currently-encrypted file, commit .sops.yaml + manifest.
+# Never `git add -u`. Aborts before commit if a file can't be re-encrypted.
+_scope_apply() {
+  local msg="$1"
+  if ! emit_sops_rules "$keyvault" > "$keyvault/.sops.yaml.tmp"; then
+    rm -f "$keyvault/.sops.yaml.tmp"
+    die "Refusing to write .sops.yaml — see error above (fix $SCOPES_FILE_NAME)."
+  fi
+  mv "$keyvault/.sops.yaml.tmp" "$keyvault/.sops.yaml"
+  local thin
+  thin="$(awk -F': ' '/^    age:/{n=gsub(/,/,",",$2)+1; if(n<3) print n}' "$keyvault/.sops.yaml" | head -1 || true)"
+  [ -n "$thin" ] && warn "⚠ A generated rule has < 3 recipients — emergency recovery at risk (spec §7)."
+  local -a touched=(); local f
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    [ -f "$keyvault/$f" ] || continue
+    if sops filestatus "$keyvault/$f" 2>/dev/null | grep -q '"encrypted":[[:space:]]*true'; then
+      if sops updatekeys -y "$keyvault/$f" >/dev/null 2>&1; then touched+=("$f")
+      else die "sops updatekeys failed for $f — are you on a machine that can decrypt everything? Aborting (no commit)."; fi
+    fi
+  done < <(scope_list_encrypted_files "$keyvault")
+  git add -- .sops.yaml "$SCOPES_FILE_NAME"
+  [ ${#touched[@]} -gt 0 ] && git add -- "${touched[@]}"
+  git commit -q -m "$msg"
+  info "✓ $msg (re-encrypted ${#touched[@]} file(s))"
+}
 
 case "$sub" in
   show)
@@ -64,8 +104,30 @@ case "$sub" in
       [ "$any" = "1" ] || echo "  (none)"
     fi
     ;;
-  set|regen)
-    die "'scope $sub' is implemented in a later change — not available yet"
+  set)
+    export SOPS_AGE_KEY_FILE="$(age_key_file)"
+    [ -f "$SOPS_AGE_KEY_FILE" ] || die "Age private key not found: $SOPS_AGE_KEY_FILE"
+    machine="${1:-}"; spec="${2:-}"
+    [ -n "$machine" ] && [ -n "$spec" ] || die "Usage: agentkeys scope set <machine> <all|path,path,...>"
+    [ -f "$keyvault/recipients/$machine.age.pub" ] || die "Unknown machine '$machine' (no recipients/$machine.age.pub)"
+    _scope_ensure_manifest
+    if [ "$spec" = "all" ]; then
+      yq -i ".recipients.\"$machine\" = \"all\"" "$keyvault/$SCOPES_FILE_NAME"
+    else
+      yq -i ".recipients.\"$machine\" = []" "$keyvault/$SCOPES_FILE_NAME"
+      IFS=',' read -r -a _paths <<< "$spec"
+      for p in "${_paths[@]}"; do
+        p="$(printf '%s' "$p" | xargs)"
+        [ -n "$p" ] && yq -i ".recipients.\"$machine\" += [\"$p\"]" "$keyvault/$SCOPES_FILE_NAME"
+      done
+    fi
+    _scope_apply "scope: set $machine = $spec"
+    ;;
+  regen)
+    export SOPS_AGE_KEY_FILE="$(age_key_file)"
+    [ -f "$SOPS_AGE_KEY_FILE" ] || die "Age private key not found: $SOPS_AGE_KEY_FILE"
+    [ -f "$keyvault/$SCOPES_FILE_NAME" ] || die "No $SCOPES_FILE_NAME to regen from"
+    _scope_apply "scope: regenerate .sops.yaml from manifest"
     ;;
   *) usage >&2; exit 1 ;;
 esac
