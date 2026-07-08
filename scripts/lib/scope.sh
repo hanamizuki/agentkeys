@@ -11,11 +11,6 @@
 
 SCOPES_FILE_NAME=".agentkeys-scopes.yaml"
 
-# Rule/emit order: files/ first — they carry encrypted_regex and also match a
-# bare \.yaml$, so their rules must precede the generic ones (sops uses the
-# first matching creation_rule).
-_SCOPE_DIRS=(files shared agents services)
-
 # Escape a vault-relative path into an anchored-alternation-safe regex atom.
 # Escapes EVERY RE2 metacharacter (sops uses Go's regexp) so a filename with
 # e.g. '+' or '[' maps to an exact path_regex instead of a pattern that could
@@ -50,19 +45,21 @@ scope_read_recipients() {
   shopt -u nullglob
 }
 
-# Encrypted yaml files as vault-relative paths, files/ first, each dir sorted.
-# Recurses (find, not a one-level glob) so a nested file like
-# agents/nested/deep.yaml — creatable via `agentkeys edit` — is included, and
-# therefore gets re-encrypted on a scope change (a one-level scan would leave a
-# revoked recipient still able to decrypt it).
+# Every encrypted-eligible yaml in the vault as a vault-relative path, sorted.
+# Scans the WHOLE vault (not just the canonical dirs) so any .yaml an operator
+# created via `agentkeys edit` — nested or in a non-standard top-level dir like
+# misc/ — is re-encrypted on a scope change; a dir-limited scan would leave a
+# revoked recipient still able to decrypt such a file. Excludes the CLI-managed
+# metadata files and recipients/ pubkeys, which are never sops-encrypted.
 scope_list_encrypted_files() {
-  local keyvault="$1" d f
-  for d in "${_SCOPE_DIRS[@]}"; do
-    [ -d "$keyvault/$d" ] || continue
-    while IFS= read -r f; do
-      [ -n "$f" ] && printf '%s\n' "${f#"$keyvault"/}"
-    done < <(find "$keyvault/$d" -type f -name '*.yaml' 2>/dev/null | LC_ALL=C sort)
-  done
+  local keyvault="$1" f
+  while IFS= read -r f; do
+    f="${f#"$keyvault"/}"
+    case "$f" in
+      .sops.yaml|"$SCOPES_FILE_NAME"|recipients/*) continue ;;
+    esac
+    [ -n "$f" ] && printf '%s\n' "$f"
+  done < <(find "$keyvault" -type f -name '*.yaml' -not -path '*/.git/*' 2>/dev/null | LC_ALL=C sort)
   return 0
 }
 

@@ -55,4 +55,19 @@ echo '{"K":"f"}' > "$VAULT/agents/future.yaml"
 ( cd "$VAULT" && SOPS_AGE_KEY_FILE="$FIXTURE_HOME/keys/core.txt" sops -e -i agents/future.yaml )
 ck "edge decrypts a pre-listed future path" "$(probe edge agents/future.yaml)" "OK"
 
+# --- review fix (r8): re-running add-recipient for a registered machine with
+# --scope must FAIL loudly (a silent no-op would drop the requested scope change
+# — the caller believes access was narrowed when nothing happened).
+if add edge "$EDGE" --scope agents/boba.yaml >/dev/null 2>&1; then
+  echo "FAIL: same-pubkey re-run with --scope should exit non-zero"; fail=1
+fi
+ck "manifest unchanged by rejected re-run" \
+  "$(yq -o json '.recipients.edge' "$VAULT/$SCOPES_FILE_NAME" | jq -c .)" \
+  '["agents/boba.yaml","agents/future.yaml"]'
+# ...while a plain re-run (no --scope) stays a benign no-op.
+add edge "$EDGE" >/dev/null 2>&1 || { echo "FAIL: plain same-pubkey re-run should be a no-op success"; fail=1; }
+ck "manifest unchanged by plain re-run" \
+  "$(yq -o json '.recipients.edge' "$VAULT/$SCOPES_FILE_NAME" | jq -c .)" \
+  '["agents/boba.yaml","agents/future.yaml"]'
+
 [ "$fail" -eq 0 ] && echo "PASS: add-recipient-scope" || exit 1

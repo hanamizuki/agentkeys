@@ -100,6 +100,12 @@ recipient_file="$keyvault/recipients/$machine.age.pub"
 if [ -f "$recipient_file" ]; then
   existing="$(cat "$recipient_file")"
   if [ "$existing" = "$pubkey" ]; then
+    # A same-pubkey re-run is a no-op ONLY when no explicit scope was requested.
+    # If --scope was given, the caller wants a scope change — don't silently
+    # succeed while leaving access unchanged; point them at scope set.
+    if [ "$scope_spec" != "all" ]; then
+      die "Recipient $machine already registered. To change its scope, run: agentkeys scope set $machine $scope_spec"
+    fi
     info "Recipient $machine already registered with same pubkey. No-op."
     exit 0
   fi

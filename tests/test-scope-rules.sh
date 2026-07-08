@@ -21,15 +21,15 @@ has() { if printf '%s' "$2" | grep -qF "$3"; then :; else echo "FAIL: $1 — mis
 hasnt() { if printf '%s' "$2" | grep -qF "$3"; then echo "FAIL: $1 — unexpected [$3]"; fail=1; fi; }
 
 # --- helpers ---
-ck "list files/ first" \
-  "$(scope_list_encrypted_files "$VAULT" | head -1)" \
-  ""   # no files yet → empty first line; add files below and re-test ordering
+ck "empty vault lists nothing" "$(scope_list_encrypted_files "$VAULT")" ""
 
 # Add encrypted files: boba (both), mojo (core only), a shared, a files/ manifest.
+# NB: scope_list order is plain whole-vault dictionary sort — the "files/ rules
+# come first" property lives in emit_sops_rules (asserted at the emit layer below).
 touch "$VAULT/agents/boba.yaml" "$VAULT/agents/mojo.yaml" \
       "$VAULT/shared/model.yaml" "$VAULT/files/certs.yaml"
 listed="$(scope_list_encrypted_files "$VAULT")"
-ck "files/ precedes others" "$(printf '%s' "$listed" | head -1)" "files/certs.yaml"
+has "lists files/ manifests" "$listed" "files/certs.yaml"
 has "lists agents" "$listed" "agents/boba.yaml"
 
 # --- manifest: missing file → all-all ---
@@ -67,6 +67,18 @@ hasnt "mojo age lacks edge" "$mojoline" "$EDGE"
 
 # --- determinism ---
 ck "idempotent emit" "$(emit_sops_rules "$VAULT")" "$rules"
+
+# --- emit order: files/ rules precede the others (sops uses the FIRST matching
+# creation_rule, and files/ rules carry encrypted_regex while also matching a
+# bare \.yaml$ pattern — so this order is load-bearing, not cosmetic).
+first_files_rule="$(printf '%s\n' "$rules" | grep -nF "files/certs" | head -1 | cut -d: -f1)"
+first_other_rule="$(printf '%s\n' "$rules" | grep -nF "agents/boba" | head -1 | cut -d: -f1)"
+[ -n "$first_files_rule" ] && [ -n "$first_other_rule" ] && [ "$first_files_rule" -lt "$first_other_rule" ] \
+  || { echo "FAIL: files/ exact rule must precede other exact rules (got files=$first_files_rule other=$first_other_rule)"; fail=1; }
+files_fb_line="$(printf '%s\n' "$rules" | grep -nF '^files/.*\.yaml$' | head -1 | cut -d: -f1)"
+generic_fb_line="$(printf '%s\n' "$rules" | grep -nF "path_regex: '\\.yaml\$'" | head -1 | cut -d: -f1)"
+[ -n "$files_fb_line" ] && [ -n "$generic_fb_line" ] && [ "$files_fb_line" -lt "$generic_fb_line" ] \
+  || { echo "FAIL: files/ fallback must precede the generic fallback (got files=$files_fb_line generic=$generic_fb_line)"; fail=1; }
 
 # --- scope show (read-only) via CLI ---
 # scope show needs a locatable vault (find_keyvault_root wants .sops.yaml).
@@ -113,10 +125,20 @@ fi
   || { echo "FAIL: scoped machine should be fail-closed on new file"; fail=1; }
 rm -f "$VAULT/shared/brandnew.yaml"
 
-# --- review fix (r7-1): scope_list recurses into nested directories ---
-mkdir -p "$VAULT/agents/nested"; touch "$VAULT/agents/nested/deep.yaml"
-has "scope_list includes nested file" "$(scope_list_encrypted_files "$VAULT")" "agents/nested/deep.yaml"
-rm -rf "$VAULT/agents/nested"
+# --- review fix (r7-1 + r8): scope_list scans the WHOLE vault ---
+# Nested dirs AND non-standard top-level dirs must be listed (else a scope
+# change would skip re-encrypting them, leaving a revoked key able to decrypt);
+# the CLI-managed metadata files and recipients/ must be excluded.
+mkdir -p "$VAULT/agents/nested" "$VAULT/misc"
+touch "$VAULT/agents/nested/deep.yaml" "$VAULT/misc/foo.yaml" "$VAULT/recipients/decoy.yaml"
+listed_all="$(scope_list_encrypted_files "$VAULT")"
+has   "scope_list includes nested file"       "$listed_all" "agents/nested/deep.yaml"
+has   "scope_list includes non-standard dir"  "$listed_all" "misc/foo.yaml"
+hasnt "scope_list excludes .sops.yaml"        "$listed_all" ".sops.yaml"
+hasnt "scope_list excludes scopes manifest"   "$listed_all" "$SCOPES_FILE_NAME"
+hasnt "scope_list excludes recipients/"       "$listed_all" "recipients/decoy.yaml"
+rm -rf "$VAULT/agents/nested" "$VAULT/misc"
+rm -f "$VAULT/recipients/decoy.yaml"
 
 # --- review fix (r7-2): a malformed manifest fails closed ---
 cp "$VAULT/$SCOPES_FILE_NAME" "$FIXTURE_HOME/scopes.bak"
