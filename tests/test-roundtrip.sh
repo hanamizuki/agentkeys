@@ -2,28 +2,14 @@
 # Smoke test: init → add-recipient → encrypt → sync → verify roundtrip.
 # Runs in an isolated HOME — no side effects on the host system.
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/lib/vault-fixture.sh"
+fixture_require_tools
+fixture_new
+trap 'rm -rf "$FIXTURE_HOME"' EXIT
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-FAKE_HOME="$(mktemp -d)"
-trap 'rm -rf "$FAKE_HOME"' EXIT
-
-export HOME="$FAKE_HOME"
-export GIT_AUTHOR_NAME="test" GIT_COMMITTER_NAME="test"
-export GIT_AUTHOR_EMAIL="test@test" GIT_COMMITTER_EMAIL="test@test"
-
-# Dependencies
-for cmd in sops age age-keygen git jq yq; do
-  command -v "$cmd" >/dev/null 2>&1 || { echo "SKIP: $cmd not installed"; exit 0; }
-done
-
-VAULT="$FAKE_HOME/test-vault"
-
-# 1. Generate age key
-mkdir -p "$FAKE_HOME/.age"
-age-keygen -o "$FAKE_HOME/.age/key.txt" 2>/dev/null
-chmod 600 "$FAKE_HOME/.age/key.txt"
-export AGE_KEY_FILE="$FAKE_HOME/.age/key.txt"
-unset SOPS_AGE_KEY_FILE 2>/dev/null || true
+VAULT="$FIXTURE_HOME/test-vault"
+export AGE_KEY_FILE="$FIXTURE_HOME/keys/test.txt"
+fixture_keygen test >/dev/null    # active machine's key
 
 # 2. Init vault
 bash "$REPO/agentkeys" init "$VAULT" >/dev/null
@@ -40,7 +26,7 @@ AGENTKEYS_KEYVAULT="$VAULT" bash "$REPO/agentkeys" add-recipient test-machine >/
 )
 
 # 5. Sync
-SECRETS="$FAKE_HOME/.secrets"
+SECRETS="$FIXTURE_HOME/.secrets"
 AGENTKEYS_KEYVAULT="$VAULT" bash "$REPO/agentkeys" sync --no-pull --secrets-dir "$SECRETS" >/dev/null
 
 # 6. Verify
