@@ -140,8 +140,10 @@ case "$sub" in
       yq -i ".recipients.\"$machine\" = []" "$keyvault/$SCOPES_FILE_NAME"
       IFS=',' read -r -a _paths <<< "$spec"
       for p in "${_paths[@]}"; do
-        p="$(printf '%s' "$p" | xargs)"
-        [ -n "$p" ] && yq -i ".recipients.\"$machine\" += [\"$p\"]" "$keyvault/$SCOPES_FILE_NAME"
+        # Shell-safe trim (xargs would mangle quotes/backslashes) + pass the
+        # literal path to yq via env, never embedded in the expression.
+        p="${p#"${p%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"
+        [ -n "$p" ] && p="$p" yq -i ".recipients.\"$machine\" += [strenv(p)]" "$keyvault/$SCOPES_FILE_NAME"
       done
     fi
     _scope_apply "scope: set $machine = $spec"

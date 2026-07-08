@@ -51,19 +51,18 @@ scope_read_recipients() {
 }
 
 # Encrypted yaml files as vault-relative paths, files/ first, each dir sorted.
+# Recurses (find, not a one-level glob) so a nested file like
+# agents/nested/deep.yaml — creatable via `agentkeys edit` — is included, and
+# therefore gets re-encrypted on a scope change (a one-level scan would leave a
+# revoked recipient still able to decrypt it).
 scope_list_encrypted_files() {
   local keyvault="$1" d f
   for d in "${_SCOPE_DIRS[@]}"; do
-    shopt -s nullglob
-    local group=()
-    for f in "$keyvault/$d"/*.yaml; do group+=("${f#$keyvault/}"); done
-    shopt -u nullglob
-    [ ${#group[@]} -gt 0 ] && printf '%s\n' "${group[@]}" | LC_ALL=C sort
+    [ -d "$keyvault/$d" ] || continue
+    while IFS= read -r f; do
+      [ -n "$f" ] && printf '%s\n' "${f#"$keyvault"/}"
+    done < <(find "$keyvault/$d" -type f -name '*.yaml' 2>/dev/null | LC_ALL=C sort)
   done
-  # Always succeed: an empty dir makes the last `[ -gt 0 ] &&` short-circuit to
-  # a non-zero return, which under `set -e` (CLI callers) aborts the enclosing
-  # `{ ...; }` command group in emit_sops_rules — dropping the manifest-path
-  # union that follows. Listing zero files is not an error.
   return 0
 }
 
@@ -76,7 +75,23 @@ scope_load_manifest() {
   local keyvault="$1"
   local p="$keyvault/$SCOPES_FILE_NAME"
   if [ -f "$p" ]; then
-    yq -o json '.' "$p"
+    # Fail closed on a malformed manifest: bad YAML, a missing/renamed
+    # `recipients:` key, or a value that isn't "all"/an array would otherwise
+    # let scope_machine_allows default everything to "all" and generate
+    # all-recipient rules. Reject instead.
+    local json
+    if ! json="$(yq -o json '.' "$p" 2>/dev/null)"; then
+      printf 'agentkeys: %s is not valid YAML\n' "$SCOPES_FILE_NAME" >&2
+      return 1
+    fi
+    if ! printf '%s' "$json" | jq -e '
+        (.recipients | type) == "object"
+        and (.recipients | to_entries | all(.value == "all" or (.value | type == "array")))
+      ' >/dev/null 2>&1; then
+      printf 'agentkeys: %s malformed — .recipients must map each machine to "all" or a path list\n' "$SCOPES_FILE_NAME" >&2
+      return 1
+    fi
+    printf '%s' "$json"
     return
   fi
   local obj='{"version":1,"recipients":{}}' name pub
@@ -106,7 +121,7 @@ scope_machine_allows() {
 # the file's real recipients.
 scope_all_ruled_paths() {
   local keyvault="$1" mj
-  mj="$(scope_load_manifest "$keyvault")"
+  mj="$(scope_load_manifest "$keyvault")" || return 1
   { scope_list_encrypted_files "$keyvault"
     printf '%s' "$mj" | jq -r '.recipients[] | select(type=="array") | .[]'
   } | LC_ALL=C sort -u
@@ -115,7 +130,7 @@ scope_all_ruled_paths() {
 # Emit full .sops.yaml to stdout. Deterministic.
 emit_sops_rules() {
   local keyvault="$1"
-  local mj; mj="$(scope_load_manifest "$keyvault")"
+  local mj; mj="$(scope_load_manifest "$keyvault")" || return 1
 
   local -a machines=(); local -A PUB=()
   local name pub

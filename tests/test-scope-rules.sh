@@ -113,6 +113,19 @@ fi
   || { echo "FAIL: scoped machine should be fail-closed on new file"; fail=1; }
 rm -f "$VAULT/shared/brandnew.yaml"
 
+# --- review fix (r7-1): scope_list recurses into nested directories ---
+mkdir -p "$VAULT/agents/nested"; touch "$VAULT/agents/nested/deep.yaml"
+has "scope_list includes nested file" "$(scope_list_encrypted_files "$VAULT")" "agents/nested/deep.yaml"
+rm -rf "$VAULT/agents/nested"
+
+# --- review fix (r7-2): a malformed manifest fails closed ---
+cp "$VAULT/$SCOPES_FILE_NAME" "$FIXTURE_HOME/scopes.bak"
+printf 'version: 1\nrecipientz:\n  core: all\n' > "$VAULT/$SCOPES_FILE_NAME"   # typo'd key
+if scope_load_manifest "$VAULT" >/dev/null 2>&1; then
+  echo "FAIL: malformed manifest should fail closed"; fail=1
+fi
+cp "$FIXTURE_HOME/scopes.bak" "$VAULT/$SCOPES_FILE_NAME"
+
 # --- review fix (Finding 3): emit fails clearly on a zero-recipient file ---
 # Scope BOTH machines to boba only; mojo/model/certs become undecryptable.
 cat > "$VAULT/$SCOPES_FILE_NAME" <<YAML

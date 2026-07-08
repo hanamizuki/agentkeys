@@ -80,4 +80,9 @@ fi
   git diff --cached --name-only | grep -qx unrelated.txt && echo STAGED || echo GONE ) > "$FIXTURE_HOME/p3"
 ck "unrelated staged not swept into scope commit" "$(cat "$FIXTURE_HOME/p3")" "STAGED"
 
+# --- review fix (r7-3): scope-path trimming strips spaces without xargs mangling ---
+( cd "$VAULT" && AGE_KEY_FILE="$FIXTURE_HOME/keys/core.txt" AGENTKEYS_KEYVAULT="$VAULT" \
+    bash "$REPO/agentkeys" scope set edge " agents/boba.yaml , agents/mojo.yaml " ) >/dev/null 2>&1
+ck "spaces trimmed in scope paths" "$(yq -o json '.recipients.edge' "$VAULT/$SCOPES_FILE_NAME" | jq -c .)" '["agents/boba.yaml","agents/mojo.yaml"]'
+
 [ "$fail" -eq 0 ] && echo "PASS: scope-mutate" || exit 1

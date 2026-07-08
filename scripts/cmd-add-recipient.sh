@@ -147,8 +147,9 @@ else
   yq -i ".recipients.\"$machine\" = []" "$scopes_path"
   IFS=',' read -r -a _paths <<< "$scope_spec"
   for p in "${_paths[@]}"; do
-    p="$(printf '%s' "$p" | xargs)"
-    [ -n "$p" ] && yq -i ".recipients.\"$machine\" += [\"$p\"]" "$scopes_path"
+    # Shell-safe trim (not xargs) + pass the literal path to yq via env.
+    p="${p#"${p%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"
+    [ -n "$p" ] && p="$p" yq -i ".recipients.\"$machine\" += [strenv(p)]" "$scopes_path"
   done
 fi
 if ! emit_sops_rules "$keyvault" > "$keyvault/.sops.yaml.tmp"; then
