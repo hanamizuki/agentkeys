@@ -300,22 +300,28 @@ scope_apply() {
   done < <(scope_all_ruled_paths "$keyvault")
   local -a paths=(.sops.yaml "$SCOPES_FILE_NAME" "$@")
   [ ${#touched[@]} -gt 0 ] && paths+=("${touched[@]}")
+  # Git pathspecs treat [], *, ? as fnmatch globs — a vault filename like
+  # agents/a[1].yaml would sweep the unrelated bystander agents/a1.yaml
+  # (possibly plaintext!) into the scope commit. :(literal) pins every
+  # pathspec use (add / no-op check / commit / reset) to the exact names.
+  local -a lit=(); local lp
+  for lp in "${paths[@]}"; do lit+=(":(literal)$lp"); done
   # Staging/commit failures also restore the snapshot: unstage OUR paths
   # first (a partial add must not linger in the shared index; scoped to our
   # pathspec so unrelated staged work is untouched), then roll back.
-  if ! git -C "$keyvault" add -- "${paths[@]}" 2>/dev/null; then
-    git -C "$keyvault" reset -q -- "${paths[@]}" 2>/dev/null || true
+  if ! git -C "$keyvault" add -- "${lit[@]}" 2>/dev/null; then
+    git -C "$keyvault" reset -q -- "${lit[@]}" 2>/dev/null || true
     _scope_fail "git add failed for the scope change — restored the pre-command state, no commit."
   fi
   # No-op (re-setting the same scope, or regen right after add-recipient):
   # nothing staged among our paths → vault already in the desired state.
-  if git -C "$keyvault" diff --cached --quiet -- "${paths[@]}"; then
+  if git -C "$keyvault" diff --cached --quiet -- "${lit[@]}"; then
     _scope_end
     info "✓ ${msg%%$'\n'*} (already up to date)"
     return 0
   fi
-  if ! git -C "$keyvault" commit -q -m "$msg" -- "${paths[@]}"; then
-    git -C "$keyvault" reset -q -- "${paths[@]}" 2>/dev/null || true
+  if ! git -C "$keyvault" commit -q -m "$msg" -- "${lit[@]}"; then
+    git -C "$keyvault" reset -q -- "${lit[@]}" 2>/dev/null || true
     _scope_fail "git commit failed for the scope change — restored the pre-command state."
   fi
   _scope_end

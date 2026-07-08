@@ -39,3 +39,9 @@ fixture_as() {
   AGENTKEYS_KEYVAULT="$VAULT" \
     bash "$REPO/agentkeys" "$@"
 }
+
+# Portable content hash: md5 -q is macOS-only, md5sum is coreutils (Linux).
+fixture_hash() {
+  if command -v md5 >/dev/null 2>&1; then md5 -q "$1"
+  else md5sum "$1" | awk '{print $1}'; fi
+}

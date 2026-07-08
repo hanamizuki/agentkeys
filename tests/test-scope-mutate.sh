@@ -140,13 +140,31 @@ fi
   echo '{"P":"t"}' > secrets/hidden.yaml
   SOPS_AGE_KEY_FILE="$FIXTURE_HOME/keys/core.txt" sops -e -i secrets/hidden.yaml )
 manifest_before="$(cat "$VAULT/$SCOPES_FILE_NAME")"
-hidden_before="$(md5 -q "$VAULT/secrets/hidden.yaml")"
+hidden_before="$(fixture_hash "$VAULT/secrets/hidden.yaml")"
 if ( cd "$VAULT" && AGE_KEY_FILE="$FIXTURE_HOME/keys/core.txt" AGENTKEYS_KEYVAULT="$VAULT" \
     bash "$REPO/agentkeys" scope set edge agents/boba.yaml,secrets/hidden.yaml ) >/dev/null 2>&1; then
   echo "FAIL: scope set naming a gitignored path should exit non-zero"; fail=1
 fi
 ck "manifest restored after rejected ignored path" "$(cat "$VAULT/$SCOPES_FILE_NAME")" "$manifest_before"
-ck "ignored file untouched after rejected set" "$(md5 -q "$VAULT/secrets/hidden.yaml")" "$hidden_before"
+ck "ignored file untouched after rejected set" "$(fixture_hash "$VAULT/secrets/hidden.yaml")" "$hidden_before"
 rm -rf "$VAULT/secrets" "$VAULT/.gitignore"
+
+# --- review fix (r12-1, P1): git pathspec metacharacters in vault filenames
+# are staged/committed as LITERALS. 'agents/a[1].yaml' used to be read as an
+# fnmatch glob: the literal file was silently left out of the scope commit
+# while the unrelated bystander 'agents/a1.yaml' (plaintext!) was swept in.
+( cd "$VAULT"
+  echo '{"K":"lit"}' > 'agents/a[1].yaml'
+  SOPS_AGE_KEY_FILE="$FIXTURE_HOME/keys/core.txt" sops -e -i 'agents/a[1].yaml'
+  echo 'plaintext bystander' > agents/a1.yaml )
+( cd "$VAULT" && AGE_KEY_FILE="$FIXTURE_HOME/keys/core.txt" AGENTKEYS_KEYVAULT="$VAULT" \
+    bash "$REPO/agentkeys" scope set edge 'agents/boba.yaml,agents/a[1].yaml' ) >/dev/null 2>&1 \
+  || { echo "FAIL: scope set granting a bracket-named file errored"; fail=1; }
+( cd "$VAULT" && git show --name-only --pretty=format: HEAD ) > "$FIXTURE_HOME/last_commit_files"
+grep -qxF 'agents/a[1].yaml' "$FIXTURE_HOME/last_commit_files" \
+  || { echo "FAIL: literal bracket-named file missing from the scope commit"; fail=1; }
+grep -qxF 'agents/a1.yaml' "$FIXTURE_HOME/last_commit_files" \
+  && { echo "FAIL: unrelated plaintext bystander swept into the scope commit"; fail=1; }
+ck "bystander still untracked" "$(cd "$VAULT" && git status --porcelain -- agents/a1.yaml)" "?? agents/a1.yaml"
 
 [ "$fail" -eq 0 ] && echo "PASS: scope-mutate" || exit 1

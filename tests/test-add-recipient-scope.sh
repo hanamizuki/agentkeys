@@ -87,7 +87,7 @@ ck "manifest unchanged by rejected --scope all re-run" \
 # here (never committed) — a checkout-HEAD style rollback cannot restore it.
 FOURTH="$(fixture_keygen fourth)"
 before_st="$(cd "$VAULT" && git status --porcelain)"
-future_before="$(md5 -q "$VAULT/agents/future.yaml")"
+future_before="$(fixture_hash "$VAULT/agents/future.yaml")"
 if ( cd "$FIXTURE_HOME" && AGE_KEY_FILE="$FIXTURE_HOME/keys/edge.txt" AGENTKEYS_KEYVAULT="$VAULT" \
     bash "$REPO/agentkeys" add-recipient fourth "$FOURTH" ) >/dev/null 2>&1; then
   echo "FAIL: add-recipient as a scoped machine should fail (cannot updatekeys everything)"; fail=1
@@ -97,7 +97,7 @@ ck "manifest has no fourth after failed add" \
   "$(yq -o json '.recipients.fourth // "absent"' "$VAULT/$SCOPES_FILE_NAME" | jq -c .)" '"absent"'
 ck "failed add-recipient leaves tree as it was" "$(cd "$VAULT" && git status --porcelain)" "$before_st"
 ck "untracked encrypted file restored after failed add" \
-  "$(md5 -q "$VAULT/agents/future.yaml")" "$future_before"
+  "$(fixture_hash "$VAULT/agents/future.yaml")" "$future_before"
 
 # --- review fix (r9-4, P2): an INVALID existing manifest must be rejected
 # BEFORE anything is written — previously yq -i died under set -e after the
