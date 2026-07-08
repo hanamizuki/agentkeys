@@ -181,6 +181,18 @@ scope_load_manifest() {
       printf 'agentkeys: %s omits registered recipient(s): %s — list each machine explicitly, or delete the file to reset every machine to "all"\n' "$SCOPES_FILE_NAME" "$missing" >&2
       return 1
     fi
+    # Reject scope paths git ignores (init ignores secrets/, .secrets/): an
+    # ignored file is never committed or synced, so it is not a vault secret
+    # — and updatekeys-then-git-add on one would abort AFTER re-keying it.
+    # Outside a git work tree check-ignore exits 128 → nothing is rejected.
+    local ip
+    while IFS= read -r ip; do
+      [ -n "$ip" ] || continue
+      if git -C "$keyvault" check-ignore -q "$ip" 2>/dev/null; then
+        printf 'agentkeys: %s lists gitignored path %s — ignored files are not vault secrets\n' "$SCOPES_FILE_NAME" "$ip" >&2
+        return 1
+      fi
+    done < <(printf '%s' "$json" | jq -r '.recipients[] | select(type=="array") | .[]')
     printf '%s' "$json"
     return
   fi
@@ -288,7 +300,13 @@ scope_apply() {
   done < <(scope_all_ruled_paths "$keyvault")
   local -a paths=(.sops.yaml "$SCOPES_FILE_NAME" "$@")
   [ ${#touched[@]} -gt 0 ] && paths+=("${touched[@]}")
-  git -C "$keyvault" add -- "${paths[@]}"
+  # Staging/commit failures also restore the snapshot: unstage OUR paths
+  # first (a partial add must not linger in the shared index; scoped to our
+  # pathspec so unrelated staged work is untouched), then roll back.
+  if ! git -C "$keyvault" add -- "${paths[@]}" 2>/dev/null; then
+    git -C "$keyvault" reset -q -- "${paths[@]}" 2>/dev/null || true
+    _scope_fail "git add failed for the scope change — restored the pre-command state, no commit."
+  fi
   # No-op (re-setting the same scope, or regen right after add-recipient):
   # nothing staged among our paths → vault already in the desired state.
   if git -C "$keyvault" diff --cached --quiet -- "${paths[@]}"; then
@@ -296,7 +314,10 @@ scope_apply() {
     info "✓ ${msg%%$'\n'*} (already up to date)"
     return 0
   fi
-  git -C "$keyvault" commit -q -m "$msg" -- "${paths[@]}"
+  if ! git -C "$keyvault" commit -q -m "$msg" -- "${paths[@]}"; then
+    git -C "$keyvault" reset -q -- "${paths[@]}" 2>/dev/null || true
+    _scope_fail "git commit failed for the scope change — restored the pre-command state."
+  fi
   _scope_end
   info "✓ ${msg%%$'\n'*} (re-encrypted ${#touched[@]} file(s))"
 }

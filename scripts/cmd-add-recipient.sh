@@ -145,7 +145,17 @@ if [ ! -f "$scopes_path" ]; then
   scope_load_manifest "$keyvault" | yq -P '.' > "$scopes_path"
   info "Seeded $SCOPES_FILE_NAME (existing recipients = all — simple-mode equivalent)"
 fi
-scope_manifest_set_machine "$scopes_path" "$machine" "$scope_spec"
+# Write the machine's scope: an explicit --scope always applies; a brand-new
+# machine defaults to "all"; a machine ALREADY in the manifest (key
+# replacement/rotation) keeps its existing scope — re-keying a path-scoped
+# machine without repeating --scope must not silently widen it to the vault.
+if [ "$scope_explicit" = "1" ]; then
+  scope_manifest_set_machine "$scopes_path" "$machine" "$scope_spec"
+elif ! yq -e ".recipients | has(\"$machine\")" "$scopes_path" >/dev/null 2>&1; then
+  scope_manifest_set_machine "$scopes_path" "$machine" "all"
+else
+  info "Keeping existing scope for $machine (pass --scope to change it)"
+fi
 
 # The shared write path (lib/scope.sh): regenerate .sops.yaml from the
 # manifest, re-encrypt every ruled file, commit with an exact pathspec. Dies

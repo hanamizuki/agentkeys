@@ -130,4 +130,23 @@ if ( cd "$VAULT" && AGE_KEY_FILE="$FIXTURE_HOME/keys/core.txt" AGENTKEYS_KEYVAUL
   echo "FAIL: scope regen with extra args should exit non-zero"; fail=1
 fi
 
+# --- review fix (r11-2, P2): a scope path git IGNORES is rejected before any
+# mutation — an ignored file is not a vault secret (never committed/synced),
+# and updatekeys-then-git-add on one used to abort AFTER re-keying it, outside
+# the rollback path, stranding a half-applied scope change.
+( cd "$VAULT"
+  printf 'secrets/\n' > .gitignore
+  mkdir -p secrets
+  echo '{"P":"t"}' > secrets/hidden.yaml
+  SOPS_AGE_KEY_FILE="$FIXTURE_HOME/keys/core.txt" sops -e -i secrets/hidden.yaml )
+manifest_before="$(cat "$VAULT/$SCOPES_FILE_NAME")"
+hidden_before="$(md5 -q "$VAULT/secrets/hidden.yaml")"
+if ( cd "$VAULT" && AGE_KEY_FILE="$FIXTURE_HOME/keys/core.txt" AGENTKEYS_KEYVAULT="$VAULT" \
+    bash "$REPO/agentkeys" scope set edge agents/boba.yaml,secrets/hidden.yaml ) >/dev/null 2>&1; then
+  echo "FAIL: scope set naming a gitignored path should exit non-zero"; fail=1
+fi
+ck "manifest restored after rejected ignored path" "$(cat "$VAULT/$SCOPES_FILE_NAME")" "$manifest_before"
+ck "ignored file untouched after rejected set" "$(md5 -q "$VAULT/secrets/hidden.yaml")" "$hidden_before"
+rm -rf "$VAULT/secrets" "$VAULT/.gitignore"
+
 [ "$fail" -eq 0 ] && echo "PASS: scope-mutate" || exit 1

@@ -126,4 +126,24 @@ if add seventh "$(fixture_keygen seventh)" --scope "agents/boba.yaml," >/dev/nul
 fi
 [ ! -f "$VAULT/recipients/seventh.age.pub" ] || { echo "FAIL: rejected trailing-comma --scope still wrote seventh.age.pub"; fail=1; }
 
+# --- review fix (r11-1, P1): replacing a scoped machine's KEY (different
+# pubkey, confirmed overwrite, NO --scope) must PRESERVE its manifest scope.
+# Key rotation is routine ops — it must not silently widen a path-scoped
+# machine to the whole vault just because --scope wasn't repeated.
+EDGE2="$(fixture_keygen edge2)"
+printf 'y\n' | add edge "$EDGE2" >/dev/null 2>&1 \
+  || { echo "FAIL: key-replacement add-recipient errored"; fail=1; }
+ck "scope preserved across key replacement" \
+  "$(yq -o json '.recipients.edge' "$VAULT/$SCOPES_FILE_NAME" | jq -c .)" \
+  '["agents/boba.yaml","agents/future.yaml"]'
+ck "replacement key reads its scoped file" "$(probe edge2 agents/boba.yaml)" "OK"
+ck "replacement key DENIED out-of-scope"   "$(probe edge2 agents/mojo.yaml)" "DENIED"
+# An EXPLICIT --scope on a key replacement still applies the requested scope.
+EDGE3="$(fixture_keygen edge3)"
+printf 'y\n' | add edge "$EDGE3" --scope all >/dev/null 2>&1 \
+  || { echo "FAIL: key-replacement with explicit --scope all errored"; fail=1; }
+ck "explicit --scope all on key replacement widens" \
+  "$(yq -o json '.recipients.edge' "$VAULT/$SCOPES_FILE_NAME" | jq -c .)" '"all"'
+ck "widened replacement key reads mojo" "$(probe edge3 agents/mojo.yaml)" "OK"
+
 [ "$fail" -eq 0 ] && echo "PASS: add-recipient-scope" || exit 1
