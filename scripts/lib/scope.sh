@@ -60,6 +60,11 @@ scope_list_encrypted_files() {
     shopt -u nullglob
     [ ${#group[@]} -gt 0 ] && printf '%s\n' "${group[@]}" | LC_ALL=C sort
   done
+  # Always succeed: an empty dir makes the last `[ -gt 0 ] &&` short-circuit to
+  # a non-zero return, which under `set -e` (CLI callers) aborts the enclosing
+  # `{ ...; }` command group in emit_sops_rules — dropping the manifest-path
+  # union that follows. Listing zero files is not an error.
+  return 0
 }
 
 # Load manifest as JSON. Missing file → synthesize all-"all" from recipients
@@ -127,7 +132,15 @@ emit_sops_rules() {
       files/*) FILES_GROUP[$csv]="${FILES_GROUP[$csv]:+${FILES_GROUP[$csv]}|}$atom" ;;
       *)       OTHER_GROUP[$csv]="${OTHER_GROUP[$csv]:+${OTHER_GROUP[$csv]}|}$atom" ;;
     esac
-  done < <(scope_list_encrypted_files "$keyvault")
+  done < <(
+    # Existing encrypted files ∪ every exact path listed in the manifest, so a
+    # scoped path gets an exact rule even before its file exists — otherwise it
+    # would fall through to the all-scope fallback and lock out the very machine
+    # the manifest granted it to.
+    { scope_list_encrypted_files "$keyvault"
+      printf '%s' "$mj" | jq -r '.recipients[] | select(type=="array") | .[]'
+    } | LC_ALL=C sort -u
+  )
 
   cat <<'HDR'
 # .sops.yaml — encryption rules for this keyvault repo

@@ -47,4 +47,12 @@ ck "edge STILL denied mojo after 3rd add" "$(probe edge agents/mojo.yaml)" "DENI
 ck "third (all) reads mojo"               "$(probe third agents/mojo.yaml)" "OK"
 ck "manifest edge unchanged"  "$(yq -o json '.recipients.edge' "$VAULT/$SCOPES_FILE_NAME" | jq -c .)" '["agents/boba.yaml"]'
 
+# --- review fix (r5): a manifest path works even before its file exists ---
+# grant edge a not-yet-existing path, then create it — edge must decrypt it.
+( cd "$FIXTURE_HOME" && AGE_KEY_FILE="$FIXTURE_HOME/keys/core.txt" AGENTKEYS_KEYVAULT="$VAULT" \
+    bash "$REPO/agentkeys" scope set edge agents/boba.yaml,agents/future.yaml ) >/dev/null 2>&1
+echo '{"K":"f"}' > "$VAULT/agents/future.yaml"
+( cd "$VAULT" && SOPS_AGE_KEY_FILE="$FIXTURE_HOME/keys/core.txt" sops -e -i agents/future.yaml )
+ck "edge decrypts a pre-listed future path" "$(probe edge agents/future.yaml)" "OK"
+
 [ "$fail" -eq 0 ] && echo "PASS: add-recipient-scope" || exit 1

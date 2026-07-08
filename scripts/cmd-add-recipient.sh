@@ -67,9 +67,6 @@ check_deps
 # Find keyvault root
 keyvault="$(find_keyvault_root)" || die "Not inside a keyvault repo (run 'agentkeys init <path>' first, or cd into one)"
 info "Using keyvault: $keyvault"
-cd "$keyvault"   # sops updatekeys resolves .sops.yaml from cwd — do this before
-                 # any sops call (fixes config-not-found when keyvault is a
-                 # sub-directory of the invocation cwd)
 
 # Export SOPS_AGE_KEY_FILE so the `sops updatekeys` step below can decrypt
 # existing files. Without this, sops falls back to its default lookup
@@ -114,6 +111,12 @@ fi
 
 echo "$pubkey" > "$recipient_file"
 info "✓ Wrote $recipient_file"
+
+# The (possibly relative) pubkey-file arg is now resolved and the pubkey saved,
+# so it's safe to cd into the vault — sops updatekeys below resolves .sops.yaml
+# from cwd (fixes config-not-found when the keyvault is a sub-directory of the
+# invocation cwd). Do this before any sops call.
+cd "$keyvault"
 
 # Collect all recipients
 all_pubkeys=()
