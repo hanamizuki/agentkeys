@@ -53,4 +53,17 @@ ck "manifest records edge scope"  "$(yq -o json '.recipients.edge' "$VAULT/$SCOP
   || { echo "FAIL: scope regen errored"; fail=1; }
 ck "edge reads mojo again (regen)" "$(probe edge agents/mojo.yaml)" "OK"
 
+# --- review fix (Finding 2, r4): failed updatekeys rolls back to a clean tree ---
+# Narrow edge to boba and commit a clean baseline.
+( cd "$VAULT" && AGE_KEY_FILE="$FIXTURE_HOME/keys/core.txt" AGENTKEYS_KEYVAULT="$VAULT" \
+    bash "$REPO/agentkeys" scope set edge agents/boba.yaml ) >/dev/null 2>&1
+before="$(cd "$VAULT" && git status --porcelain)"
+# Attempt 'scope set edge all' AS edge — edge can't decrypt mojo, so updatekeys
+# must fail and roll back, leaving the working tree exactly as before.
+( cd "$VAULT" && AGE_KEY_FILE="$FIXTURE_HOME/keys/edge.txt" AGENTKEYS_KEYVAULT="$VAULT" \
+    bash "$REPO/agentkeys" scope set edge all ) >/dev/null 2>&1
+after="$(cd "$VAULT" && git status --porcelain)"
+ck "failed updatekeys leaves clean tree" "$after" "$before"
+ck "manifest still boba after rollback" "$(yq -o json '.recipients.edge' "$VAULT/$SCOPES_FILE_NAME" | jq -c .)" '["agents/boba.yaml"]'
+
 [ "$fail" -eq 0 ] && echo "PASS: scope-mutate" || exit 1

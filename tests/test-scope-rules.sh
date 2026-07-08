@@ -88,6 +88,14 @@ if AGENTKEYS_KEYVAULT="$VAULT" bash "$REPO/agentkeys" scope show nonesuch >/dev/
   echo "FAIL: scope show should reject unknown machine"; fail=1
 fi
 
+# --- review fix (Finding 3, r4): emit stays valid YAML for quoted filenames ---
+ck "yaml single-quote doubling" "$(_yaml_sq "a'b")" "'a''b'"
+touch "$VAULT/agents/wei'rd.yaml"
+if emit_sops_rules "$VAULT" | yq -o json '.' >/dev/null 2>&1; then :; else
+  echo "FAIL: emit produced invalid YAML for a quoted filename"; fail=1
+fi
+rm -f "$VAULT/agents/wei'rd.yaml"
+
 # --- review fix (Finding B): a NEW file is still encryptable via fallback ---
 # manifest here is core=all, edge=[boba]; fallback grants "all" machines (core).
 emit_sops_rules "$VAULT" > "$VAULT/.sops.yaml"

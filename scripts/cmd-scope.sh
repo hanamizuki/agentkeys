@@ -48,21 +48,35 @@ _scope_ensure_manifest() {
 # Never `git add -u`. Aborts before commit if a file can't be re-encrypted.
 _scope_apply() {
   local msg="$1"
+  local -a touched=()
+  # Restore manifest, .sops.yaml, and any already-updatekeyed files to HEAD on
+  # failure so a partial/broadened state can't be left in (and accidentally
+  # committed from) the working tree. A freshly-seeded manifest (absent in
+  # HEAD) is removed rather than checked out.
+  _scope_rollback() {
+    git checkout HEAD -- .sops.yaml 2>/dev/null || true
+    if git cat-file -e "HEAD:$SCOPES_FILE_NAME" 2>/dev/null; then
+      git checkout HEAD -- "$SCOPES_FILE_NAME" 2>/dev/null || true
+    else
+      rm -f "$keyvault/$SCOPES_FILE_NAME"
+    fi
+    [ ${#touched[@]} -gt 0 ] && git checkout HEAD -- "${touched[@]}" 2>/dev/null || true
+  }
   if ! emit_sops_rules "$keyvault" > "$keyvault/.sops.yaml.tmp"; then
-    rm -f "$keyvault/.sops.yaml.tmp"
+    rm -f "$keyvault/.sops.yaml.tmp"; _scope_rollback
     die "Refusing to write .sops.yaml — see error above (fix $SCOPES_FILE_NAME)."
   fi
   mv "$keyvault/.sops.yaml.tmp" "$keyvault/.sops.yaml"
   local thin
   thin="$(awk -F': ' '/^    age:/{n=gsub(/,/,",",$2)+1; if(n<3) print n}' "$keyvault/.sops.yaml" | head -1 || true)"
   [ -n "$thin" ] && warn "⚠ A generated rule has < 3 recipients — emergency recovery at risk (spec §7)."
-  local -a touched=(); local f
+  local f
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     [ -f "$keyvault/$f" ] || continue
     if sops filestatus "$keyvault/$f" 2>/dev/null | grep -q '"encrypted":[[:space:]]*true'; then
       if sops updatekeys -y "$keyvault/$f" >/dev/null 2>&1; then touched+=("$f")
-      else die "sops updatekeys failed for $f — are you on a machine that can decrypt everything? Aborting (no commit)."; fi
+      else _scope_rollback; die "sops updatekeys failed for $f — are you on a machine that can decrypt everything? Rolled back, no commit."; fi
     fi
   done < <(scope_list_encrypted_files "$keyvault")
   git add -- .sops.yaml "$SCOPES_FILE_NAME"

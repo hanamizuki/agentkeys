@@ -32,6 +32,11 @@ _scope_regex_atom() {
   printf '%s' "$out"
 }
 
+# Wrap a string as a YAML single-quoted scalar, doubling any embedded single
+# quote. The RE2 escape above handles regex metachars; this is the orthogonal
+# YAML layer so a path_regex value containing "'" doesn't break .sops.yaml.
+_yaml_sq() { local s="${1//\'/\'\'}"; printf "'%s'" "$s"; }
+
 # recipients/<machine>.age.pub → "machine<TAB>pubkey" (unsorted; callers that
 # need order pipe to `LC_ALL=C sort`).
 scope_read_recipients() {
@@ -141,14 +146,14 @@ HDR
   local key
   while IFS= read -r key; do
     [ -n "$key" ] || continue
-    printf "  - path_regex: '^(%s)\$'\n" "${FILES_GROUP[$key]}"
-    printf "    encrypted_regex: '^(content)\$'\n"
+    printf "  - path_regex: %s\n" "$(_yaml_sq "^(${FILES_GROUP[$key]})\$")"
+    printf "    encrypted_regex: %s\n" "$(_yaml_sq '^(content)$')"
     printf "    age: %s\n" "$key"
   done < <(printf '%s\n' "${!FILES_GROUP[@]}" | LC_ALL=C sort)
 
   while IFS= read -r key; do
     [ -n "$key" ] || continue
-    printf "  - path_regex: '^(%s)\$'\n" "${OTHER_GROUP[$key]}"
+    printf "  - path_regex: %s\n" "$(_yaml_sq "^(${OTHER_GROUP[$key]})\$")"
     printf "    age: %s\n" "$key"
   done < <(printf '%s\n' "${!OTHER_GROUP[@]}" | LC_ALL=C sort)
 
