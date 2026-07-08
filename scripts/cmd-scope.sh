@@ -87,20 +87,15 @@ case "$sub" in
     machine="${1:-}"; spec="${2:-}"
     [ -n "$machine" ] && [ -n "$spec" ] || die "Usage: agentkeys scope set <machine> <all|path,path,...>"
     [ -f "$keyvault/recipients/$machine.age.pub" ] || die "Unknown machine '$machine' (no recipients/$machine.age.pub)"
+    # Pre-flight before any write: reject an invalid manifest / an escaping
+    # path while the tree is untouched (yq -i on a broken manifest would die
+    # under set -e with a half-edited file and no rollback).
+    scope_load_manifest "$keyvault" >/dev/null \
+      || die "Fix $SCOPES_FILE_NAME before changing scope (see error above)."
+    scope_spec_validate "$spec"
     _scope_begin "$keyvault"   # snapshot BEFORE we (or ensure_manifest) touch anything
     _scope_ensure_manifest
-    if [ "$spec" = "all" ]; then
-      yq -i ".recipients.\"$machine\" = \"all\"" "$keyvault/$SCOPES_FILE_NAME"
-    else
-      yq -i ".recipients.\"$machine\" = []" "$keyvault/$SCOPES_FILE_NAME"
-      IFS=',' read -r -a _paths <<< "$spec"
-      for p in "${_paths[@]}"; do
-        # Shell-safe trim (xargs would mangle quotes/backslashes) + pass the
-        # literal path to yq via env, never embedded in the expression.
-        p="${p#"${p%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"
-        [ -n "$p" ] && p="$p" yq -i ".recipients.\"$machine\" += [strenv(p)]" "$keyvault/$SCOPES_FILE_NAME"
-      done
-    fi
+    scope_manifest_set_machine "$keyvault/$SCOPES_FILE_NAME" "$machine" "$spec"
     scope_apply "$keyvault" "scope: set $machine = $spec"
     ;;
   regen)

@@ -148,6 +148,46 @@ if scope_load_manifest "$VAULT" >/dev/null 2>&1; then
 fi
 cp "$FIXTURE_HOME/scopes.bak" "$VAULT/$SCOPES_FILE_NAME"
 
+# --- review fix (r9-1, P1): a manifest that EXISTS but omits a registered
+# recipient must fail closed — the absent->all default would silently widen
+# that machine to the whole vault on the next regen (hand-edit / merge losing
+# a line = grant-all instead of revoke). Only a MISSING manifest file may
+# synthesize all-'all' (legacy-vault upgrade path, asserted above).
+printf 'version: 1\nrecipients:\n  core: all\n' > "$VAULT/$SCOPES_FILE_NAME"   # edge omitted
+if scope_load_manifest "$VAULT" >/dev/null 2>&1; then
+  echo "FAIL: manifest omitting a registered recipient should fail closed"; fail=1
+fi
+cp "$FIXTURE_HOME/scopes.bak" "$VAULT/$SCOPES_FILE_NAME"
+
+# scope_machine_allows itself is fail-closed too: a machine absent from a
+# LOADED manifest json gets no access (defense in depth under the validator).
+ck "allows denies unlisted machine" "$(scope_machine_allows "$mj" ghost agents/boba.yaml)" "0"
+
+# --- review fix (r9-3, P2): manifest paths must stay inside the vault —
+# a '../' path would make updatekeys touch (and rewrite) files OUTSIDE the
+# vault, beyond the entry-state snapshot's protection.
+printf 'version: 1\nrecipients:\n  core: all\n  edge:\n    - ../escape.yaml\n' > "$VAULT/$SCOPES_FILE_NAME"
+if scope_load_manifest "$VAULT" >/dev/null 2>&1; then
+  echo "FAIL: manifest path escaping the vault should fail closed"; fail=1
+fi
+printf 'version: 1\nrecipients:\n  core: all\n  edge:\n    - /etc/absolute.yaml\n' > "$VAULT/$SCOPES_FILE_NAME"
+if scope_load_manifest "$VAULT" >/dev/null 2>&1; then
+  echo "FAIL: absolute manifest path should fail closed"; fail=1
+fi
+cp "$FIXTURE_HOME/scopes.bak" "$VAULT/$SCOPES_FILE_NAME"
+
+# --- review fix (r9-2, P2): gitignored plaintext yaml (secrets/, .secrets/ —
+# exactly what init's .gitignore declares) must NOT enter rule generation: a
+# local plaintext file would otherwise land in committed .sops.yaml rules and
+# could deadlock scope changes via the zero-recipient guard. Non-git vaults
+# (like this fixture so far) skip the filter — assert both behaviors.
+mkdir -p "$VAULT/secrets"; touch "$VAULT/secrets/plain.yaml"
+has "non-git vault lists everything" "$(scope_list_encrypted_files "$VAULT")" "secrets/plain.yaml"
+( cd "$VAULT" && git init -q && printf 'secrets/\n' > .gitignore )
+hasnt "git vault excludes ignored plaintext" "$(scope_list_encrypted_files "$VAULT")" "secrets/plain.yaml"
+has "git vault still lists tracked-side files" "$(scope_list_encrypted_files "$VAULT")" "agents/boba.yaml"
+rm -rf "$VAULT/secrets" "$VAULT/.git" "$VAULT/.gitignore"
+
 # --- review fix (Finding 3): emit fails clearly on a zero-recipient file ---
 # Scope BOTH machines to boba only; mojo/model/certs become undecryptable.
 cat > "$VAULT/$SCOPES_FILE_NAME" <<YAML

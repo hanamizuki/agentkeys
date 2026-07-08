@@ -32,6 +32,57 @@ _scope_regex_atom() {
 # YAML layer so a path_regex value containing "'" doesn't break .sops.yaml.
 _yaml_sq() { local s="${1//\'/\'\'}"; printf "'%s'" "$s"; }
 
+# A scope path must stay inside the vault: relative, with no empty, '.' or
+# '..' segments. Ruled paths are later resolved as "$keyvault/<path>" and fed
+# to sops updatekeys — a traversal path would let a hand-edited manifest (or
+# a --scope typo) rewrite files OUTSIDE the vault, beyond the entry-state
+# snapshot's protection. Pure parameter expansion: no globbing on user input.
+_scope_path_ok() {
+  local p="$1" seg rest
+  [ -n "$p" ] || return 1
+  case "$p" in /*) return 1 ;; esac
+  rest="$p/"
+  while [ -n "$rest" ]; do
+    seg="${rest%%/*}"; rest="${rest#*/}"
+    case "$seg" in ''|'.'|'..') return 1 ;; esac
+  done
+  return 0
+}
+
+# Validate a comma-separated --scope / scope-set spec ("all" or path list);
+# dies on a vault-escaping path. Callers run this BEFORE writing anything.
+scope_spec_validate() {
+  local spec="$1" p
+  [ "$spec" = "all" ] && return 0
+  local -a _sv_paths=()
+  IFS=',' read -r -a _sv_paths <<< "$spec"
+  for p in "${_sv_paths[@]}"; do
+    p="${p#"${p%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"
+    [ -z "$p" ] && continue
+    _scope_path_ok "$p" || die "Invalid scope path '$p' — must stay inside the vault (relative, no '..', '.' or empty segments)"
+  done
+}
+
+# Write <machine>'s scope into the manifest: "all" or comma-separated exact
+# paths (shell-safe trimmed — xargs would mangle quotes/backslashes — and
+# passed to yq via strenv, never embedded in the expression). The machine
+# name is validated by both callers (add-recipient regex / scope set
+# recipient-file check), so it is safe inside the yq path literal.
+scope_manifest_set_machine() {
+  local manifest="$1" machine="$2" spec="$3" p
+  if [ "$spec" = "all" ]; then
+    yq -i ".recipients.\"$machine\" = \"all\"" "$manifest"
+    return 0
+  fi
+  yq -i ".recipients.\"$machine\" = []" "$manifest"
+  local -a _sm_paths=()
+  IFS=',' read -r -a _sm_paths <<< "$spec"
+  for p in "${_sm_paths[@]}"; do
+    p="${p#"${p%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"
+    [ -n "$p" ] && p="$p" yq -i ".recipients.\"$machine\" += [strenv(p)]" "$manifest"
+  done
+}
+
 # recipients/<machine>.age.pub → "machine<TAB>pubkey" (unsorted; callers that
 # need order pipe to `LC_ALL=C sort`).
 scope_read_recipients() {
@@ -58,7 +109,13 @@ scope_list_encrypted_files() {
     case "$f" in
       .sops.yaml|"$SCOPES_FILE_NAME"|recipients/*) continue ;;
     esac
-    [ -n "$f" ] && printf '%s\n' "$f"
+    [ -n "$f" ] || continue
+    # Respect the vault's gitignore (init ignores secrets/, .secrets/): a
+    # local plaintext yaml must not shape committed .sops.yaml rules, and
+    # could deadlock every scope change via the zero-recipient guard. Outside
+    # a git work tree check-ignore exits 128 → nothing is filtered.
+    if git -C "$keyvault" check-ignore -q "$f" 2>/dev/null; then continue; fi
+    printf '%s\n' "$f"
   done < <(find "$keyvault" -type f -name '*.yaml' -not -path '*/.git/*' 2>/dev/null | LC_ALL=C sort)
   return 0
 }
@@ -73,9 +130,9 @@ scope_load_manifest() {
   local p="$keyvault/$SCOPES_FILE_NAME"
   if [ -f "$p" ]; then
     # Fail closed on a malformed manifest: bad YAML, a missing/renamed
-    # `recipients:` key, or a value that isn't "all"/an array would otherwise
-    # let scope_machine_allows default everything to "all" and generate
-    # all-recipient rules. Reject instead.
+    # `recipients:` key, a value that isn't "all"/a path list, or a path that
+    # escapes the vault. Rejecting here (the single load point) covers hand
+    # edits that never went through scope set / add-recipient validation.
     local json
     if ! json="$(yq -o json '.' "$p" 2>/dev/null)"; then
       printf 'agentkeys: %s is not valid YAML\n' "$SCOPES_FILE_NAME" >&2
@@ -83,9 +140,29 @@ scope_load_manifest() {
     fi
     if ! printf '%s' "$json" | jq -e '
         (.recipients | type) == "object"
-        and (.recipients | to_entries | all(.value == "all" or (.value | type == "array")))
+        and (.recipients | to_entries | all(
+          .value == "all"
+          or ((.value | type) == "array" and (.value | all(
+            type == "string" and length > 0
+            and (startswith("/") | not)
+            and (split("/") | all(. != "" and . != "." and . != ".."))
+          )))
+        ))
       ' >/dev/null 2>&1; then
-      printf 'agentkeys: %s malformed — .recipients must map each machine to "all" or a path list\n' "$SCOPES_FILE_NAME" >&2
+      printf 'agentkeys: %s malformed — .recipients must map each machine to "all" or a list of vault-relative paths (no "..", "." or absolute paths)\n' "$SCOPES_FILE_NAME" >&2
+      return 1
+    fi
+    # A manifest that EXISTS but omits a registered recipient fails closed:
+    # the machine would otherwise silently default to "all" and the next
+    # regen would re-encrypt the whole vault to its key (a hand edit or merge
+    # that loses a line must not turn into a grant-all). Only a MISSING
+    # manifest file synthesizes all-"all" (legacy-vault upgrade, below).
+    local missing
+    missing="$(scope_read_recipients "$keyvault" | cut -f1 | LC_ALL=C sort | jq -R -s \
+      --argjson have "$(printf '%s' "$json" | jq '.recipients | keys')" \
+      -r 'split("\n") | map(select(length > 0)) | . - $have | join(", ")')"
+    if [ -n "$missing" ]; then
+      printf 'agentkeys: %s omits registered recipient(s): %s — list each machine explicitly, or delete the file to reset every machine to "all"\n' "$SCOPES_FILE_NAME" "$missing" >&2
       return 1
     fi
     printf '%s' "$json"
@@ -100,15 +177,17 @@ scope_load_manifest() {
 }
 
 # 1 if <machine> may decrypt <path> per manifest, else 0.
-# scope value: "all" → yes; array → exact-path membership; absent → "all"
-# for whole-vault default, BUT a machine present with an array is fail-closed
-# on paths not listed (new files are NOT auto-granted to scoped machines).
+# scope value: "all" → yes; array → exact-path membership (fail-closed on
+# paths not listed — new files are NOT auto-granted to scoped machines);
+# absent → DENY. The loader already rejects a manifest that omits a
+# registered machine; this default is defense in depth for direct callers —
+# an unknown name must never widen to the whole vault.
 scope_machine_allows() {
-  local mj="$1" machine="$2" path="$3" val
-  val="$(printf '%s' "$mj" | jq -r --arg m "$machine" '.recipients[$m] // "all"')"
-  [ "$val" = "all" ] && { echo 1; return; }
-  printf '%s' "$mj" | jq -e --arg m "$machine" --arg p "$path" \
-    '(.recipients[$m] // []) | index($p) != null' >/dev/null 2>&1 && echo 1 || echo 0
+  local mj="$1" machine="$2" path="$3"
+  printf '%s' "$mj" | jq -e --arg m "$machine" --arg p "$path" '
+      .recipients[$m] as $v
+      | ($v == "all") or ((($v | type) == "array") and ($v | index($p) != null))
+    ' >/dev/null 2>&1 && echo 1 || echo 0
 }
 
 # ---------- entry-state snapshot / restore ----------

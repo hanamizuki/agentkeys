@@ -116,10 +116,20 @@ if [ -f "$recipient_file" ]; then
   confirm "Overwrite?" || die "Aborted"
 fi
 
-# Snapshot the vault's entry state BEFORE writing anything — on any failure,
-# scope_apply restores exactly this state: the pubkey file we're about to
-# write, a manifest we may seed below, and every on-disk encrypted file
-# (tracked or not). No half-onboarded vault, no destroyed hand-edits.
+# Pre-flight, BEFORE anything is written: an invalid existing manifest or a
+# vault-escaping --scope path must be rejected while the tree is still
+# untouched. (Previously an invalid manifest made yq -i die under set -e
+# after the pubkey was already on disk but before any rollback existed —
+# a half-onboarded vault.) After this point every mutation is covered by
+# the _scope_begin snapshot.
+scope_load_manifest "$keyvault" >/dev/null \
+  || die "Fix $SCOPES_FILE_NAME before adding a recipient (see error above)."
+scope_spec_validate "$scope_spec"
+
+# Snapshot the vault's entry state — on any failure, scope_apply restores
+# exactly this state: the pubkey file we're about to write, a manifest we
+# may seed below, and every on-disk encrypted file (tracked or not). No
+# half-onboarded vault, no destroyed hand-edits.
 _scope_begin "$keyvault" "recipients/$machine.age.pub"
 
 echo "$pubkey" > "$recipient_file"
@@ -135,17 +145,7 @@ if [ ! -f "$scopes_path" ]; then
   scope_load_manifest "$keyvault" | yq -P '.' > "$scopes_path"
   info "Seeded $SCOPES_FILE_NAME (existing recipients = all — simple-mode equivalent)"
 fi
-if [ "$scope_spec" = "all" ]; then
-  yq -i ".recipients.\"$machine\" = \"all\"" "$scopes_path"
-else
-  yq -i ".recipients.\"$machine\" = []" "$scopes_path"
-  IFS=',' read -r -a _paths <<< "$scope_spec"
-  for p in "${_paths[@]}"; do
-    # Shell-safe trim (not xargs) + pass the literal path to yq via env.
-    p="${p#"${p%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"
-    [ -n "$p" ] && p="$p" yq -i ".recipients.\"$machine\" += [strenv(p)]" "$scopes_path"
-  done
-fi
+scope_manifest_set_machine "$scopes_path" "$machine" "$scope_spec"
 
 # The shared write path (lib/scope.sh): regenerate .sops.yaml from the
 # manifest, re-encrypt every ruled file, commit with an exact pathspec. Dies

@@ -99,4 +99,24 @@ ck "failed add-recipient leaves tree as it was" "$(cd "$VAULT" && git status --p
 ck "untracked encrypted file restored after failed add" \
   "$(md5 -q "$VAULT/agents/future.yaml")" "$future_before"
 
+# --- review fix (r9-4, P2): an INVALID existing manifest must be rejected
+# BEFORE anything is written — previously yq -i died under set -e after the
+# pubkey was already on disk but before scope_apply installed its rollback,
+# leaving a half-onboarded vault.
+printf 'version: 1\nrecipientz: broken\n' > "$VAULT/$SCOPES_FILE_NAME"
+FIFTH="$(fixture_keygen fifth)"
+if add fifth "$FIFTH" >/dev/null 2>&1; then
+  echo "FAIL: add-recipient should reject an invalid manifest"; fail=1
+fi
+[ ! -f "$VAULT/recipients/fifth.age.pub" ] || { echo "FAIL: invalid-manifest add left fifth.age.pub behind"; fail=1; }
+ck "invalid manifest left untouched" "$(cat "$VAULT/$SCOPES_FILE_NAME")" "$(printf 'version: 1\nrecipientz: broken\n')"
+git -C "$VAULT" checkout -- "$SCOPES_FILE_NAME" 2>/dev/null || true
+
+# --scope paths that escape the vault are rejected up front (same guard as
+# the manifest validator — updatekeys must never touch files outside).
+if add sixth "$(fixture_keygen sixth)" --scope ../escape.yaml >/dev/null 2>&1; then
+  echo "FAIL: --scope with a vault-escaping path should exit non-zero"; fail=1
+fi
+[ ! -f "$VAULT/recipients/sixth.age.pub" ] || { echo "FAIL: rejected --scope path still wrote sixth.age.pub"; fail=1; }
+
 [ "$fail" -eq 0 ] && echo "PASS: add-recipient-scope" || exit 1
