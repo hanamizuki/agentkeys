@@ -119,4 +119,11 @@ if add sixth "$(fixture_keygen sixth)" --scope ../escape.yaml >/dev/null 2>&1; t
 fi
 [ ! -f "$VAULT/recipients/sixth.age.pub" ] || { echo "FAIL: rejected --scope path still wrote sixth.age.pub"; fail=1; }
 
+# ...and so are empty --scope components (trailing comma): they used to die
+# under set -e mid-onboarding, after the pubkey landed (r10-1).
+if add seventh "$(fixture_keygen seventh)" --scope "agents/boba.yaml," >/dev/null 2>&1; then
+  echo "FAIL: --scope with a trailing comma should exit non-zero"; fail=1
+fi
+[ ! -f "$VAULT/recipients/seventh.age.pub" ] || { echo "FAIL: rejected trailing-comma --scope still wrote seventh.age.pub"; fail=1; }
+
 [ "$fail" -eq 0 ] && echo "PASS: add-recipient-scope" || exit 1

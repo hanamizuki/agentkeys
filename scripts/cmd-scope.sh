@@ -50,6 +50,7 @@ _scope_ensure_manifest() {
 
 case "$sub" in
   show)
+    [ $# -le 1 ] || die "Unexpected argument(s): ${*:2} — usage: agentkeys scope show [machine]"
     mj="$(scope_load_manifest "$keyvault")"
     machine="${1:-}"
     if [ -z "$machine" ]; then
@@ -86,6 +87,9 @@ case "$sub" in
     [ -f "$SOPS_AGE_KEY_FILE" ] || die "Age private key not found: $SOPS_AGE_KEY_FILE"
     machine="${1:-}"; spec="${2:-}"
     [ -n "$machine" ] && [ -n "$spec" ] || die "Usage: agentkeys scope set <machine> <all|path,path,...>"
+    # Space-separated paths would silently grant only $2 while reporting
+    # success — a partial grant the operator can't see. Hard error instead.
+    [ $# -eq 2 ] || die "Unexpected argument(s): ${*:3} — separate scope paths with commas, not spaces"
     [ -f "$keyvault/recipients/$machine.age.pub" ] || die "Unknown machine '$machine' (no recipients/$machine.age.pub)"
     # Pre-flight before any write: reject an invalid manifest / an escaping
     # path while the tree is untouched (yq -i on a broken manifest would die
@@ -99,6 +103,7 @@ case "$sub" in
     scope_apply "$keyvault" "scope: set $machine = $spec"
     ;;
   regen)
+    [ $# -eq 0 ] || die "Unexpected argument(s): $* — usage: agentkeys scope regen"
     export SOPS_AGE_KEY_FILE="$(age_key_file)"
     [ -f "$SOPS_AGE_KEY_FILE" ] || die "Age private key not found: $SOPS_AGE_KEY_FILE"
     [ -f "$keyvault/$SCOPES_FILE_NAME" ] || die "No $SCOPES_FILE_NAME to regen from"

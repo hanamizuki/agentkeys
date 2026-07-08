@@ -50,15 +50,27 @@ _scope_path_ok() {
 }
 
 # Validate a comma-separated --scope / scope-set spec ("all" or path list);
-# dies on a vault-escaping path. Callers run this BEFORE writing anything.
+# dies on a vault-escaping path OR an empty component (trailing comma,
+# blank-only spec). Empty components are a hard error, not a skip: they are
+# almost always a truncated path list, and tolerating them let the write
+# loop's skip branch return non-zero under set -e AFTER the manifest was
+# rewritten — a half-applied scope change. Callers run this BEFORE writing.
 scope_spec_validate() {
   local spec="$1" p
   [ "$spec" = "all" ] && return 0
+  [ -n "$spec" ] || die "Empty scope spec — use 'all' or a comma-separated path list"
+  # Literal comma check FIRST: bash field splitting DROPS an empty field
+  # after a trailing delimiter, so 'a.yaml,' would otherwise sail through
+  # the loop below as just ['a.yaml'] — a truncated path list accepted
+  # silently. Leading/doubled commas are the same typo family.
+  case "$spec" in
+    ,*|*,|*,,*) die "Empty scope path component in '$spec' (leading, trailing or doubled comma)" ;;
+  esac
   local -a _sv_paths=()
   IFS=',' read -r -a _sv_paths <<< "$spec"
   for p in "${_sv_paths[@]}"; do
     p="${p#"${p%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"
-    [ -z "$p" ] && continue
+    [ -n "$p" ] || die "Empty scope path component in '$spec' (blank between commas?)"
     _scope_path_ok "$p" || die "Invalid scope path '$p' — must stay inside the vault (relative, no '..', '.' or empty segments)"
   done
 }
@@ -81,6 +93,10 @@ scope_manifest_set_machine() {
     p="${p#"${p%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"
     [ -n "$p" ] && p="$p" yq -i ".recipients.\"$machine\" += [strenv(p)]" "$manifest"
   done
+  # Empty components are rejected by scope_spec_validate before we're called;
+  # this keeps a (hypothetical) skipped last component from turning the
+  # function's status non-zero and killing the caller under set -e.
+  return 0
 }
 
 # recipients/<machine>.age.pub → "machine<TAB>pubkey" (unsorted; callers that

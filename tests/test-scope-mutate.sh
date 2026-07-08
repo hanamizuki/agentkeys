@@ -100,4 +100,34 @@ ck "unrelated staged not swept into scope commit" "$(cat "$FIXTURE_HOME/p3")" "S
     bash "$REPO/agentkeys" scope set edge " agents/boba.yaml , agents/mojo.yaml " ) >/dev/null 2>&1
 ck "spaces trimmed in scope paths" "$(yq -o json '.recipients.edge' "$VAULT/$SCOPES_FILE_NAME" | jq -c .)" '["agents/boba.yaml","agents/mojo.yaml"]'
 
+# --- review fix (r10-1): an EMPTY spec component (trailing comma, blank-only
+# spec) is rejected up front — it used to slip past validation, then kill the
+# caller under set -e AFTER yq rewrote the manifest but BEFORE scope_apply
+# could re-encrypt or roll back: manifest changed, files still on the old
+# recipients, no restore. Must fail BEFORE any mutation.
+manifest_before="$(cat "$VAULT/$SCOPES_FILE_NAME")"
+if ( cd "$VAULT" && AGE_KEY_FILE="$FIXTURE_HOME/keys/core.txt" AGENTKEYS_KEYVAULT="$VAULT" \
+    bash "$REPO/agentkeys" scope set edge "agents/boba.yaml," ) >/dev/null 2>&1; then
+  echo "FAIL: trailing-comma scope spec should exit non-zero"; fail=1
+fi
+ck "manifest untouched after rejected trailing comma" "$(cat "$VAULT/$SCOPES_FILE_NAME")" "$manifest_before"
+if ( cd "$VAULT" && AGE_KEY_FILE="$FIXTURE_HOME/keys/core.txt" AGENTKEYS_KEYVAULT="$VAULT" \
+    bash "$REPO/agentkeys" scope set edge " , " ) >/dev/null 2>&1; then
+  echo "FAIL: blank-only scope spec should exit non-zero"; fail=1
+fi
+ck "manifest untouched after rejected blank spec" "$(cat "$VAULT/$SCOPES_FILE_NAME")" "$manifest_before"
+
+# --- review fix (r10-2): space-separated paths are a hard error, not a
+# silent partial grant — 'scope set edge a.yaml b.yaml' used to commit a
+# scope of just a.yaml while reporting success.
+if ( cd "$VAULT" && AGE_KEY_FILE="$FIXTURE_HOME/keys/core.txt" AGENTKEYS_KEYVAULT="$VAULT" \
+    bash "$REPO/agentkeys" scope set edge agents/boba.yaml agents/mojo.yaml ) >/dev/null 2>&1; then
+  echo "FAIL: space-separated scope paths should exit non-zero"; fail=1
+fi
+ck "manifest untouched after rejected extra args" "$(cat "$VAULT/$SCOPES_FILE_NAME")" "$manifest_before"
+if ( cd "$VAULT" && AGE_KEY_FILE="$FIXTURE_HOME/keys/core.txt" AGENTKEYS_KEYVAULT="$VAULT" \
+    bash "$REPO/agentkeys" scope regen leftover ) >/dev/null 2>&1; then
+  echo "FAIL: scope regen with extra args should exit non-zero"; fail=1
+fi
+
 [ "$fail" -eq 0 ] && echo "PASS: scope-mutate" || exit 1
