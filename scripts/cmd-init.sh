@@ -6,6 +6,9 @@ set -euo pipefail
 
 # shellcheck source=lib/common.sh
 source "${AGENTKEYS_LIB_DIR:-$(dirname "${BASH_SOURCE[0]}")/lib}/common.sh"
+# scope.sh provides SCOPES_FILE_NAME (single source of truth for the manifest
+# filename) — seed an empty manifest below so a fresh vault is scope-ready.
+source "${AGENTKEYS_LIB_DIR:-$(dirname "${BASH_SOURCE[0]}")/lib}/scope.sh"
 
 usage() {
   cat <<EOF
@@ -74,6 +77,22 @@ cat > "$path/.sops.yaml" <<'EOF'
 creation_rules: []
 EOF
 
+cat > "$path/$SCOPES_FILE_NAME" <<'EOF'
+# .agentkeys-scopes.yaml — per-path recipient scope (source of truth).
+#
+# Each recipient maps to its decrypt scope:
+#   <machine>: all            → may decrypt every file in the vault
+#   <machine>:                → may decrypt ONLY the listed exact paths
+#     - agents/<name>.yaml
+#     - shared/<group>.yaml
+#
+# agentkeys reads this + the vault file list to GENERATE .sops.yaml.
+# Edit here, then run: agentkeys scope regen
+# Machines are added with their scope by: agentkeys add-recipient <m> [--scope ...]
+version: 1
+recipients: {}
+EOF
+
 cat > "$path/.gitignore" <<'EOF'
 # Prevent plaintext leakage
 secrets/
@@ -91,6 +110,7 @@ secrets/
 !*.example
 !recipients/*.age.pub
 !.sops.yaml
+!.agentkeys-scopes.yaml
 !README.md
 !.gitignore
 EOF

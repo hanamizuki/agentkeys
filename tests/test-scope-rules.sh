@@ -68,4 +68,14 @@ hasnt "mojo age lacks edge" "$mojoline" "$EDGE"
 # --- determinism ---
 ck "idempotent emit" "$(emit_sops_rules "$VAULT")" "$rules"
 
+# --- scope show (read-only) via CLI ---
+# scope show needs a locatable vault (find_keyvault_root wants .sops.yaml).
+emit_sops_rules "$VAULT" > "$VAULT/.sops.yaml"
+show_all="$(AGENTKEYS_KEYVAULT="$VAULT" bash "$REPO/agentkeys" scope show 2>&1)"
+has "show lists core" "$show_all" "core"
+has "show lists edge" "$show_all" "edge"
+show_edge="$(AGENTKEYS_KEYVAULT="$VAULT" bash "$REPO/agentkeys" scope show edge 2>&1)"
+has   "edge can read boba" "$show_edge" "agents/boba.yaml"
+hasnt "edge cannot read mojo" "$show_edge" "agents/mojo.yaml"
+
 [ "$fail" -eq 0 ] && echo "PASS: scope-rules" || exit 1
