@@ -111,6 +111,101 @@ scope_machine_allows() {
     '(.recipients[$m] // []) | index($p) != null' >/dev/null 2>&1 && echo 1 || echo 0
 }
 
+# ---------- entry-state snapshot / restore ----------
+# A failed apply must put the working tree back EXACTLY as it was when the
+# command started — NOT back to HEAD. The manifest is caller input ('scope
+# regen' is documented as "run after hand-editing it", so it may carry
+# uncommitted hand-edits), and encrypted files may be untracked; both are
+# invisible to a checkout-HEAD rollback. So: snapshot every file an apply may
+# write BEFORE the caller mutates anything, restore that snapshot on failure.
+
+# _scope_begin <keyvault> [extra vault-relative paths...]
+# Snapshot .sops.yaml + the manifest + every encrypted-eligible yaml on disk
+# (+ extras, e.g. the recipient pubkey add-recipient is about to write). A
+# path absent at entry is recorded so restore deletes it.
+_scope_begin() {
+  local keyvault="$1"; shift
+  SCOPE_SNAP_DIR="$(mktemp -d)"
+  local f
+  { printf '%s\n' ".sops.yaml" "$SCOPES_FILE_NAME" "$@"
+    scope_list_encrypted_files "$keyvault"
+  } | LC_ALL=C sort -u > "$SCOPE_SNAP_DIR/paths"
+  while IFS= read -r f; do
+    [ -f "$keyvault/$f" ] || continue
+    mkdir -p "$SCOPE_SNAP_DIR/data/$(dirname "$f")"
+    cp -p "$keyvault/$f" "$SCOPE_SNAP_DIR/data/$f"
+  done < "$SCOPE_SNAP_DIR/paths"
+}
+
+# Restore every snapshotted path to its entry state (delete what didn't exist).
+_scope_restore_entry() {
+  local keyvault="$1" f
+  [ -n "${SCOPE_SNAP_DIR:-}" ] && [ -f "$SCOPE_SNAP_DIR/paths" ] || return 0
+  while IFS= read -r f; do
+    if [ -f "$SCOPE_SNAP_DIR/data/$f" ]; then
+      cp -p "$SCOPE_SNAP_DIR/data/$f" "$keyvault/$f"
+    else
+      rm -f "$keyvault/$f"
+    fi
+  done < "$SCOPE_SNAP_DIR/paths"
+}
+
+# Discard the snapshot (on success, or after a restore).
+_scope_end() {
+  [ -n "${SCOPE_SNAP_DIR:-}" ] && rm -rf "$SCOPE_SNAP_DIR"
+  SCOPE_SNAP_DIR=""
+}
+
+# scope_apply <keyvault> <commit-msg> [extra commit paths...]
+# THE shared write path for every scope mutation (scope set, scope regen,
+# add-recipient): regenerate .sops.yaml from the manifest, re-encrypt every
+# ruled on-disk file, and commit with an exact pathspec (never add -u/-A).
+# Caller contract: call _scope_begin FIRST (before mutating the manifest or
+# writing a pubkey), then mutate, then scope_apply. On any failure the tree
+# is restored to the _scope_begin entry state and the process dies. Must run
+# on a machine whose age key decrypts everything (sops updatekeys reads each
+# file). Extra paths are committed along (and must be covered by the caller's
+# _scope_begin extras so a failure restores them too).
+scope_apply() {
+  local keyvault="$1" msg="$2"; shift 2
+  [ -n "${SCOPE_SNAP_DIR:-}" ] || die "internal: scope_apply called without _scope_begin"
+  _scope_fail() { _scope_restore_entry "$keyvault"; _scope_end; die "$1"; }
+  if ! emit_sops_rules "$keyvault" > "$keyvault/.sops.yaml.tmp"; then
+    rm -f "$keyvault/.sops.yaml.tmp"
+    _scope_fail "Refusing to write .sops.yaml — see error above (fix $SCOPES_FILE_NAME)."
+  fi
+  mv "$keyvault/.sops.yaml.tmp" "$keyvault/.sops.yaml"
+  local thin
+  thin="$(awk -F': ' '/^    age:/{n=gsub(/,/,",",$2)+1; if(n<3) print n}' "$keyvault/.sops.yaml" | head -1 || true)"
+  [ -n "$thin" ] && warn "⚠ A generated rule has < 3 recipients — emergency recovery at risk (spec §7)."
+  local f; local -a touched=()
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    [ -f "$keyvault/$f" ] || continue
+    if sops filestatus "$keyvault/$f" 2>/dev/null | grep -q '"encrypted":[[:space:]]*true'; then
+      # cd: sops updatekeys resolves .sops.yaml from cwd, not the file's dir.
+      if ( cd "$keyvault" && sops updatekeys -y "$f" >/dev/null 2>&1 ); then
+        touched+=("$f")
+      else
+        _scope_fail "sops updatekeys failed for $f — are you on a machine that can decrypt everything? Restored the pre-command state, no commit."
+      fi
+    fi
+  done < <(scope_all_ruled_paths "$keyvault")
+  local -a paths=(.sops.yaml "$SCOPES_FILE_NAME" "$@")
+  [ ${#touched[@]} -gt 0 ] && paths+=("${touched[@]}")
+  git -C "$keyvault" add -- "${paths[@]}"
+  # No-op (re-setting the same scope, or regen right after add-recipient):
+  # nothing staged among our paths → vault already in the desired state.
+  if git -C "$keyvault" diff --cached --quiet -- "${paths[@]}"; then
+    _scope_end
+    info "✓ ${msg%%$'\n'*} (already up to date)"
+    return 0
+  fi
+  git -C "$keyvault" commit -q -m "$msg" -- "${paths[@]}"
+  _scope_end
+  info "✓ ${msg%%$'\n'*} (re-encrypted ${#touched[@]} file(s))"
+}
+
 # Paths that get an exact rule (emit) and must be re-encrypted on a scope
 # change (scope apply): existing encrypted files ∪ every exact path the
 # manifest lists. Sorted & unique. Keeping emit and updatekeys on the SAME set

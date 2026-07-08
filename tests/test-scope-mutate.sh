@@ -66,6 +66,21 @@ after="$(cd "$VAULT" && git status --porcelain)"
 ck "failed updatekeys leaves clean tree" "$after" "$before"
 ck "manifest still boba after rollback" "$(yq -o json '.recipients.edge' "$VAULT/$SCOPES_FILE_NAME" | jq -c .)" '["agents/boba.yaml"]'
 
+# --- rollback must preserve pre-existing UNCOMMITTED manifest hand-edits ---
+# 'scope regen' is documented as "run after hand-editing the manifest", so the
+# manifest is caller INPUT: a failed apply must restore the tree to its ENTRY
+# state, not to HEAD (checkout HEAD would destroy the operator's hand-edit
+# along with the command's own changes).
+printf '# operator note: keep me\n' >> "$VAULT/$SCOPES_FILE_NAME"
+( cd "$VAULT" && AGE_KEY_FILE="$FIXTURE_HOME/keys/edge.txt" AGENTKEYS_KEYVAULT="$VAULT" \
+    bash "$REPO/agentkeys" scope set edge all ) >/dev/null 2>&1 \
+  && { echo "FAIL: scope set as edge should still fail here"; fail=1; }
+grep -q 'operator note: keep me' "$VAULT/$SCOPES_FILE_NAME" \
+  || { echo "FAIL: failed apply destroyed an uncommitted manifest hand-edit"; fail=1; }
+ck "hand-edited manifest keeps entry scope after failed set" \
+  "$(yq -o json '.recipients.edge' "$VAULT/$SCOPES_FILE_NAME" | jq -c .)" '["agents/boba.yaml"]'
+git -C "$VAULT" checkout -- "$SCOPES_FILE_NAME" 2>/dev/null || true
+
 # --- review fix (r6-2): a no-op regen succeeds (was: set -e on "nothing to commit") ---
 if ( cd "$VAULT" && AGE_KEY_FILE="$FIXTURE_HOME/keys/core.txt" AGENTKEYS_KEYVAULT="$VAULT" \
     bash "$REPO/agentkeys" scope regen ) >/dev/null 2>&1; then :; else

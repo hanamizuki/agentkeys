@@ -70,4 +70,33 @@ ck "manifest unchanged by plain re-run" \
   "$(yq -o json '.recipients.edge' "$VAULT/$SCOPES_FILE_NAME" | jq -c .)" \
   '["agents/boba.yaml","agents/future.yaml"]'
 
+# An EXPLICIT --scope all on a registered scoped machine is a widen request —
+# it must be rejected too (indistinguishable intent-drop otherwise: the caller
+# believes the machine was widened while nothing happened).
+if add edge "$EDGE" --scope all >/dev/null 2>&1; then
+  echo "FAIL: same-pubkey re-run with explicit --scope all should exit non-zero"; fail=1
+fi
+ck "manifest unchanged by rejected --scope all re-run" \
+  "$(yq -o json '.recipients.edge' "$VAULT/$SCOPES_FILE_NAME" | jq -c .)" \
+  '["agents/boba.yaml","agents/future.yaml"]'
+
+# --- a failed add-recipient rolls EVERYTHING back, including untracked
+# encrypted files. Run add-recipient AS edge (cannot decrypt mojo) → updatekeys
+# fails → the new pubkey, its manifest entry, and every re-encrypted file must
+# return to their entry state. agents/future.yaml is deliberately UNTRACKED
+# here (never committed) — a checkout-HEAD style rollback cannot restore it.
+FOURTH="$(fixture_keygen fourth)"
+before_st="$(cd "$VAULT" && git status --porcelain)"
+future_before="$(md5 -q "$VAULT/agents/future.yaml")"
+if ( cd "$FIXTURE_HOME" && AGE_KEY_FILE="$FIXTURE_HOME/keys/edge.txt" AGENTKEYS_KEYVAULT="$VAULT" \
+    bash "$REPO/agentkeys" add-recipient fourth "$FOURTH" ) >/dev/null 2>&1; then
+  echo "FAIL: add-recipient as a scoped machine should fail (cannot updatekeys everything)"; fail=1
+fi
+[ ! -f "$VAULT/recipients/fourth.age.pub" ] || { echo "FAIL: failed add left fourth.age.pub behind"; fail=1; }
+ck "manifest has no fourth after failed add" \
+  "$(yq -o json '.recipients.fourth // "absent"' "$VAULT/$SCOPES_FILE_NAME" | jq -c .)" '"absent"'
+ck "failed add-recipient leaves tree as it was" "$(cd "$VAULT" && git status --porcelain)" "$before_st"
+ck "untracked encrypted file restored after failed add" \
+  "$(md5 -q "$VAULT/agents/future.yaml")" "$future_before"
+
 [ "$fail" -eq 0 ] && echo "PASS: add-recipient-scope" || exit 1
