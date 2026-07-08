@@ -7,6 +7,7 @@ set -euo pipefail
 
 # shellcheck source=lib/common.sh
 source "${AGENTKEYS_LIB_DIR:-$(dirname "${BASH_SOURCE[0]}")/lib}/common.sh"
+source "${AGENTKEYS_LIB_DIR:-$(dirname "${BASH_SOURCE[0]}")/lib}/scope.sh"
 
 usage() {
   cat <<EOF
@@ -21,11 +22,17 @@ ARGUMENTS:
   <machine-name>     Alphanumeric/dash/underscore identifier (e.g. "laptop")
   [pubkey-or-file]   age1... string OR path to a file containing the pubkey
 
+OPTIONS:
+  --scope all|path,path,...   Decrypt scope for this machine (default: all).
+                              Exact vault-relative paths, comma-separated.
+
 EFFECTS:
   1. Writes pubkey to <keyvault>/recipients/<machine-name>.age.pub
-  2. Updates .sops.yaml creation_rules to include this recipient
-  3. Re-encrypts existing yaml files (sops updatekeys)
-  4. Commits the change
+  2. Records the machine's scope in .agentkeys-scopes.yaml
+  3. Regenerates .sops.yaml from the manifest (preserves existing per-path
+     scoping — does NOT revert to simple all-recipient mode)
+  4. Re-encrypts existing yaml files (sops updatekeys)
+  5. Commits the change
 
 EXAMPLES:
   # On this machine, using ~/.age/key.txt
@@ -39,12 +46,16 @@ EXAMPLES:
 EOF
 }
 
-machine="${1:-}"
-pubkey_input="${2:-}"
-
-case "$machine" in
-  ""|-h|--help|help) usage; exit 0 ;;
-esac
+machine=""; pubkey_input=""; scope_spec="all"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help|help) usage; exit 0 ;;
+    --scope) [ $# -ge 2 ] || die "--scope needs a value (all | path,path,...)"; scope_spec="$2"; shift 2 ;;
+    -*) die "Unknown option: $1" ;;
+    *) if [ -z "$machine" ]; then machine="$1"; elif [ -z "$pubkey_input" ]; then pubkey_input="$1"; else die "Unexpected arg: $1"; fi; shift ;;
+  esac
+done
+[ -n "$machine" ] || { usage; exit 0; }
 
 # Validate machine name
 if ! [[ "$machine" =~ ^[a-zA-Z0-9_-]+$ ]]; then
@@ -56,6 +67,9 @@ check_deps
 # Find keyvault root
 keyvault="$(find_keyvault_root)" || die "Not inside a keyvault repo (run 'agentkeys init <path>' first, or cd into one)"
 info "Using keyvault: $keyvault"
+cd "$keyvault"   # sops updatekeys resolves .sops.yaml from cwd — do this before
+                 # any sops call (fixes config-not-found when keyvault is a
+                 # sub-directory of the invocation cwd)
 
 # Export SOPS_AGE_KEY_FILE so the `sops updatekeys` step below can decrypt
 # existing files. Without this, sops falls back to its default lookup
@@ -112,28 +126,37 @@ mapfile -t all_pubkeys < <(printf "%s\n" "${all_pubkeys[@]}" | sort -u)
 
 age_csv="$(IFS=,; echo "${all_pubkeys[*]}")"
 
-# Rewrite .sops.yaml
-cat > "$keyvault/.sops.yaml" <<EOF
-# .sops.yaml — encryption rules for this keyvault repo
-#
-# Managed by 'agentkeys add-recipient'. Don't edit by hand unless you know
-# what you're doing — use 'agentkeys add-recipient <machine>' instead.
-#
-# Current mode: simple (all recipients can decrypt all files).
-# Future: per-file recipient differentiation for finer access control.
-
-creation_rules:
-  # Type C file manifests: encrypt only content field (paths/modes visible for audit)
-  - path_regex: '^files/.*\.yaml\$'
-    encrypted_regex: '^(content)\$'
-    age: $age_csv
-
-  # Everything else: encrypt all values
-  - path_regex: '\.yaml\$'
-    age: $age_csv
-EOF
-
-info "✓ Updated .sops.yaml with ${#all_pubkeys[@]} recipient(s)"
+# Update the scopes manifest (source of truth) then regenerate .sops.yaml via
+# emit_sops_rules. This PRESERVES any existing per-path scoping — adding a new
+# machine no longer silently reverts the vault to simple all-recipient mode.
+scopes_path="$keyvault/$SCOPES_FILE_NAME"
+scopes_seeded=0
+if [ ! -f "$scopes_path" ]; then
+  # Migration: a pre-scope vault → seed all existing recipients as "all", so
+  # behavior matches the old simple mode before we layer in this machine.
+  scope_load_manifest "$keyvault" | yq -P '.' > "$scopes_path"
+  scopes_seeded=1
+  info "Seeded $SCOPES_FILE_NAME (existing recipients = all — simple-mode equivalent)"
+fi
+if [ "$scope_spec" = "all" ]; then
+  yq -i ".recipients.\"$machine\" = \"all\"" "$scopes_path"
+else
+  yq -i ".recipients.\"$machine\" = []" "$scopes_path"
+  IFS=',' read -r -a _paths <<< "$scope_spec"
+  for p in "${_paths[@]}"; do
+    p="$(printf '%s' "$p" | xargs)"
+    [ -n "$p" ] && yq -i ".recipients.\"$machine\" += [\"$p\"]" "$scopes_path"
+  done
+fi
+if ! emit_sops_rules "$keyvault" > "$keyvault/.sops.yaml.tmp"; then
+  rm -f "$keyvault/.sops.yaml.tmp"
+  if [ "$scopes_seeded" = "1" ]; then rm -f "$scopes_path"; else git checkout HEAD -- "$SCOPES_FILE_NAME" 2>/dev/null || true; fi
+  rel_recipient="${recipient_file#$keyvault/}"
+  if git cat-file -e "HEAD:$rel_recipient" 2>/dev/null; then git checkout HEAD -- "$rel_recipient"; else rm -f "$recipient_file"; fi
+  die "Refusing to write .sops.yaml — see error above (fix $SCOPES_FILE_NAME)."
+fi
+mv "$keyvault/.sops.yaml.tmp" "$keyvault/.sops.yaml"
+info "✓ Regenerated .sops.yaml from $SCOPES_FILE_NAME ($scope_spec, ${#all_pubkeys[@]} recipient(s))"
 
 # Re-encrypt existing encrypted files. Track exactly which files we touched
 # so the commit only contains our changes — never use `git add -u` here,
@@ -153,7 +176,7 @@ failed_files=()
 while IFS= read -r f; do
   [ -z "$f" ] && continue
   case "$f" in
-    *"/.sops.yaml"|*"/recipients/"*) continue ;;
+    *"/.sops.yaml"|*"/recipients/"*|*"/$SCOPES_FILE_NAME") continue ;;
   esac
   if sops filestatus "$f" 2>/dev/null | grep -q '"encrypted":\s*true'; then
     info "  Re-encrypting $(realpath --relative-to="$keyvault" "$f" 2>/dev/null || echo "$f")"
@@ -182,6 +205,12 @@ if [ ${#failed_files[@]} -gt 0 ]; then
   if git -C "$keyvault" cat-file -e HEAD:.sops.yaml 2>/dev/null; then
     git -C "$keyvault" checkout HEAD -- .sops.yaml
   fi
+  # Manifest: restore from HEAD, or remove it if we freshly seeded it this run.
+  if [ "${scopes_seeded:-0}" = "1" ]; then
+    rm -f "$scopes_path"
+  elif git -C "$keyvault" cat-file -e "HEAD:$SCOPES_FILE_NAME" 2>/dev/null; then
+    git -C "$keyvault" checkout HEAD -- "$SCOPES_FILE_NAME"
+  fi
   # Recipient file: if it existed in HEAD (i.e. we OVERWROTE an existing
   # pubkey for this machine), restore the previous version. If it was brand
   # new in this run, just delete it.
@@ -205,8 +234,7 @@ fi
 # Commit — stage only the exact files we wrote/changed. Never `git add
 # recipients/` (whole dir): if another session left an untracked or modified
 # pubkey for a different machine, that would be swept into this commit.
-cd "$keyvault"
-git add -- "recipients/$machine.age.pub" .sops.yaml
+git add -- "recipients/$machine.age.pub" .sops.yaml "$SCOPES_FILE_NAME"
 if [ ${#re_encrypted_files[@]} -gt 0 ]; then
   git add -- "${re_encrypted_files[@]}"
 fi
