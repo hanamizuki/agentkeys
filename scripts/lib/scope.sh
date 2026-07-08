@@ -17,8 +17,20 @@ SCOPES_FILE_NAME=".agentkeys-scopes.yaml"
 _SCOPE_DIRS=(files shared agents services)
 
 # Escape a vault-relative path into an anchored-alternation-safe regex atom.
-# For our fixed path shapes only '.' needs escaping ('/' is literal in RE2).
-_scope_regex_atom() { printf '%s' "${1//./\\.}"; }
+# Escapes EVERY RE2 metacharacter (sops uses Go's regexp) so a filename with
+# e.g. '+' or '[' maps to an exact path_regex instead of a pattern that could
+# match the wrong file. '/' is literal in RE2 and left as-is.
+_scope_regex_atom() {
+  local s="$1" out="" i c
+  for (( i=0; i<${#s}; i++ )); do
+    c="${s:i:1}"
+    case "$c" in
+      '\'|'.'|'+'|'*'|'?'|'('|')'|'['|']'|'{'|'}'|'^'|'$'|'|') out+="\\$c" ;;
+      *) out+="$c" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
 
 # recipients/<machine>.age.pub → "machine<TAB>pubkey" (unsorted; callers that
 # need order pipe to `LC_ALL=C sort`).
@@ -97,6 +109,12 @@ emit_sops_rules() {
     for m in "${machines[@]}"; do
       [ "$(scope_machine_allows "$mj" "$m" "$path")" = "1" ] && pubs+=("${PUB[$m]}")
     done
+    # A file no machine can decrypt would emit an empty `age:` rule (unusable,
+    # unencryptable). Stop loudly instead of writing a broken .sops.yaml.
+    if [ ${#pubs[@]} -eq 0 ]; then
+      printf 'agentkeys: no eligible recipient for %s — every machine is scoped away from it; fix %s\n' "$path" "$SCOPES_FILE_NAME" >&2
+      return 1
+    fi
     local csv atom
     csv="$(printf '%s\n' "${pubs[@]}" | LC_ALL=C sort | paste -sd, -)"
     atom="$(_scope_regex_atom "$path")"

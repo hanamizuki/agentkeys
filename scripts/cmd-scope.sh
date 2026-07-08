@@ -47,6 +47,12 @@ case "$sub" in
         printf '  %-12s %s\n' "$name" "$val"
       done < <(scope_read_recipients "$keyvault" | LC_ALL=C sort)
     else
+      # Validate the machine is a registered recipient first — otherwise
+      # scope_machine_allows' absent-default of "all" would falsely report an
+      # unknown/typo'd machine can decrypt everything.
+      if ! scope_read_recipients "$keyvault" | cut -f1 | grep -qxF "$machine"; then
+        die "Unknown machine '$machine' (not a registered recipient)"
+      fi
       echo "Files decryptable by '$machine':"
       any=0
       while IFS= read -r f; do

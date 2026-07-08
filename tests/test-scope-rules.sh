@@ -78,4 +78,28 @@ show_edge="$(AGENTKEYS_KEYVAULT="$VAULT" bash "$REPO/agentkeys" scope show edge 
 has   "edge can read boba" "$show_edge" "agents/boba.yaml"
 hasnt "edge cannot read mojo" "$show_edge" "agents/mojo.yaml"
 
+# --- review fix (Finding 2): full RE2 escaping of path atoms ---
+ck "escape plus"    "$(_scope_regex_atom 'a+b')"   'a\+b'
+ck "escape bracket" "$(_scope_regex_atom '[p].y')" '\[p\]\.y'
+ck "slash literal"  "$(_scope_regex_atom 'x/y')"   'x/y'
+
+# --- review fix (Finding 1): scope show rejects unknown machine ---
+if AGENTKEYS_KEYVAULT="$VAULT" bash "$REPO/agentkeys" scope show nonesuch >/dev/null 2>&1; then
+  echo "FAIL: scope show should reject unknown machine"; fail=1
+fi
+
+# --- review fix (Finding 3): emit fails clearly on a zero-recipient file ---
+# Scope BOTH machines to boba only; mojo/model/certs become undecryptable.
+cat > "$VAULT/$SCOPES_FILE_NAME" <<YAML
+version: 1
+recipients:
+  core:
+    - agents/boba.yaml
+  edge:
+    - agents/boba.yaml
+YAML
+if emit_sops_rules "$VAULT" >/dev/null 2>&1; then
+  echo "FAIL: emit should fail on a zero-recipient file"; fail=1
+fi
+
 [ "$fail" -eq 0 ] && echo "PASS: scope-rules" || exit 1
