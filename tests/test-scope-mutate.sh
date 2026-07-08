@@ -66,4 +66,18 @@ after="$(cd "$VAULT" && git status --porcelain)"
 ck "failed updatekeys leaves clean tree" "$after" "$before"
 ck "manifest still boba after rollback" "$(yq -o json '.recipients.edge' "$VAULT/$SCOPES_FILE_NAME" | jq -c .)" '["agents/boba.yaml"]'
 
+# --- review fix (r6-2): a no-op regen succeeds (was: set -e on "nothing to commit") ---
+if ( cd "$VAULT" && AGE_KEY_FILE="$FIXTURE_HOME/keys/core.txt" AGENTKEYS_KEYVAULT="$VAULT" \
+    bash "$REPO/agentkeys" scope regen ) >/dev/null 2>&1; then :; else
+  echo "FAIL: no-op regen should succeed (exit 0)"; fail=1
+fi
+
+# --- review fix (r6-3): scope commit uses pathspec, doesn't sweep unrelated staged ---
+( cd "$VAULT"
+  echo x > unrelated.txt; git add unrelated.txt
+  AGE_KEY_FILE="$FIXTURE_HOME/keys/core.txt" AGENTKEYS_KEYVAULT="$VAULT" \
+    bash "$REPO/agentkeys" scope set edge all >/dev/null 2>&1
+  git diff --cached --name-only | grep -qx unrelated.txt && echo STAGED || echo GONE ) > "$FIXTURE_HOME/p3"
+ck "unrelated staged not swept into scope commit" "$(cat "$FIXTURE_HOME/p3")" "STAGED"
+
 [ "$fail" -eq 0 ] && echo "PASS: scope-mutate" || exit 1

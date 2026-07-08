@@ -237,14 +237,15 @@ fi
 # Commit — stage only the exact files we wrote/changed. Never `git add
 # recipients/` (whole dir): if another session left an untracked or modified
 # pubkey for a different machine, that would be swept into this commit.
-git add -- "recipients/$machine.age.pub" .sops.yaml "$SCOPES_FILE_NAME"
-if [ ${#re_encrypted_files[@]} -gt 0 ]; then
-  git add -- "${re_encrypted_files[@]}"
-fi
+add_paths=( "recipients/$machine.age.pub" .sops.yaml "$SCOPES_FILE_NAME" )
+[ ${#re_encrypted_files[@]} -gt 0 ] && add_paths+=( "${re_encrypted_files[@]}" )
+git add -- "${add_paths[@]}"
+# Pathspec commit so unrelated staged changes in the shared working tree aren't
+# swept into the recipient commit.
 git commit -q -m "add recipient: $machine
 
 Pubkey: $pubkey
-Total recipients: ${#all_pubkeys[@]}"
+Total recipients: ${#all_pubkeys[@]}" -- "${add_paths[@]}"
 
 info "✓ Committed"
 info ""

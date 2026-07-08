@@ -78,10 +78,19 @@ _scope_apply() {
       if sops updatekeys -y "$keyvault/$f" >/dev/null 2>&1; then touched+=("$f")
       else _scope_rollback; die "sops updatekeys failed for $f — are you on a machine that can decrypt everything? Rolled back, no commit."; fi
     fi
-  done < <(scope_list_encrypted_files "$keyvault")
-  git add -- .sops.yaml "$SCOPES_FILE_NAME"
-  [ ${#touched[@]} -gt 0 ] && git add -- "${touched[@]}"
-  git commit -q -m "$msg"
+  done < <(scope_all_ruled_paths "$keyvault")
+  local -a paths=(.sops.yaml "$SCOPES_FILE_NAME")
+  [ ${#touched[@]} -gt 0 ] && paths+=("${touched[@]}")
+  git add -- "${paths[@]}"
+  # No-op (re-setting the same scope, or regen right after add-recipient):
+  # nothing staged among our paths → vault already in the desired state.
+  if git diff --cached --quiet -- "${paths[@]}"; then
+    info "✓ $msg (already up to date)"
+    return 0
+  fi
+  # Pathspec commit so unrelated staged changes in the shared working tree are
+  # never swept into a scope commit.
+  git commit -q -m "$msg" -- "${paths[@]}"
   info "✓ $msg (re-encrypted ${#touched[@]} file(s))"
 }
 

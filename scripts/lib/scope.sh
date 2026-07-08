@@ -99,6 +99,19 @@ scope_machine_allows() {
     '(.recipients[$m] // []) | index($p) != null' >/dev/null 2>&1 && echo 1 || echo 0
 }
 
+# Paths that get an exact rule (emit) and must be re-encrypted on a scope
+# change (scope apply): existing encrypted files ∪ every exact path the
+# manifest lists. Sorted & unique. Keeping emit and updatekeys on the SAME set
+# is what prevents .sops.yaml claiming a grant/revocation that never reached
+# the file's real recipients.
+scope_all_ruled_paths() {
+  local keyvault="$1" mj
+  mj="$(scope_load_manifest "$keyvault")"
+  { scope_list_encrypted_files "$keyvault"
+    printf '%s' "$mj" | jq -r '.recipients[] | select(type=="array") | .[]'
+  } | LC_ALL=C sort -u
+}
+
 # Emit full .sops.yaml to stdout. Deterministic.
 emit_sops_rules() {
   local keyvault="$1"
@@ -132,15 +145,7 @@ emit_sops_rules() {
       files/*) FILES_GROUP[$csv]="${FILES_GROUP[$csv]:+${FILES_GROUP[$csv]}|}$atom" ;;
       *)       OTHER_GROUP[$csv]="${OTHER_GROUP[$csv]:+${OTHER_GROUP[$csv]}|}$atom" ;;
     esac
-  done < <(
-    # Existing encrypted files ∪ every exact path listed in the manifest, so a
-    # scoped path gets an exact rule even before its file exists — otherwise it
-    # would fall through to the all-scope fallback and lock out the very machine
-    # the manifest granted it to.
-    { scope_list_encrypted_files "$keyvault"
-      printf '%s' "$mj" | jq -r '.recipients[] | select(type=="array") | .[]'
-    } | LC_ALL=C sort -u
-  )
+  done < <(scope_all_ruled_paths "$keyvault")
 
   cat <<'HDR'
 # .sops.yaml — encryption rules for this keyvault repo
