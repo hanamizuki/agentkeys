@@ -158,7 +158,11 @@ if ! registered_recipients="$(scope_read_recipients "$keyvault")"; then
   SYNC_FAIL_REASON="cannot enumerate $keyvault/recipients/ (unreadable or malformed pubkey file — see error above)"
   die "$SYNC_FAIL_REASON"
 fi
-if ! printf '%s\n' "$registered_recipients" | cut -f2 | grep -qxF "$my_pubkey"; then
+# grep -qxF via <<< (not `... | grep -q`): grep -q exits at its first match
+# and under pipefail the upstream's SIGPIPE would intermittently fail this
+# check for a key that IS registered. Same pattern as machine_can_decrypt.
+registered_pubs="$(printf '%s\n' "$registered_recipients" | cut -f2)"
+if ! grep -qxF "$my_pubkey" <<< "$registered_pubs"; then
   SYNC_FAIL_REASON="this machine's age key ($my_pubkey) is not a registered recipient of $keyvault — register it with: agentkeys add-recipient <machine-name>"
   die "$SYNC_FAIL_REASON"
 fi
