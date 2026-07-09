@@ -14,6 +14,11 @@ set -euo pipefail
 
 # shellcheck source=lib/common.sh
 source "${AGENTKEYS_LIB_DIR:-$(dirname "${BASH_SOURCE[0]}")/lib}/common.sh"
+# scope.sh provides scope_list_encrypted_files — the single answer to "what
+# is a vault secret" shared with the scope generator. NB: sync does NOT
+# install the _scope_exit_trap; it never opens a scope transaction and
+# carries its own on_fail EXIT trap below.
+source "${AGENTKEYS_LIB_DIR:-$(dirname "${BASH_SOURCE[0]}")/lib}/scope.sh"
 
 usage() {
   cat <<EOF
@@ -134,12 +139,57 @@ else
   info "(--no-pull: skipping git pull)"
 fi
 
+# ---------- 1b. Validate the local key against the (fresh) vault ----------
+#
+# The per-file skip below (machine_can_decrypt) reads "my pubkey is not
+# among this file's recipients" as out-of-scope. That is only sound if this
+# machine's key IS a registered recipient at all: an unregistered key, or
+# an identity file whose '# public key:' line was stripped (sops decrypts
+# fine without it, but the pubkey can't be resolved), would skip EVERY file
+# and publish an OK state over an empty secrets dir — where the first
+# sops -d used to fail loudly. Fail before any staging exists. Runs AFTER
+# the pull: the normal onboarding path registers a machine upstream and
+# then syncs to fetch that very registration.
+if ! my_pubkey="$(age_pubkey 2>/dev/null)" || [ -z "$my_pubkey" ]; then
+  SYNC_FAIL_REASON="cannot resolve this machine's age public key from $SOPS_AGE_KEY_FILE (missing '# public key:' line? regenerate or restore the identity file header)"
+  die "$SYNC_FAIL_REASON"
+fi
+if ! registered_recipients="$(scope_read_recipients "$keyvault")"; then
+  SYNC_FAIL_REASON="cannot enumerate $keyvault/recipients/ (unreadable or malformed pubkey file — see error above)"
+  die "$SYNC_FAIL_REASON"
+fi
+# grep -qxF via <<< (not `... | grep -q`): grep -q exits at its first match
+# and under pipefail the upstream's SIGPIPE would intermittently fail this
+# check for a key that IS registered. Same pattern as machine_can_decrypt.
+registered_pubs="$(printf '%s\n' "$registered_recipients" | cut -f2)"
+if ! grep -qxF "$my_pubkey" <<< "$registered_pubs"; then
+  SYNC_FAIL_REASON="this machine's age key ($my_pubkey) is not a registered recipient of $keyvault — register it with: agentkeys add-recipient <machine-name>"
+  die "$SYNC_FAIL_REASON"
+fi
+
 # ---------- helpers ----------
 
 decrypt_to_json() {
   # Decrypt yaml file and emit JSON on stdout. Fails loudly on bad input.
   local f="$1"
   sops -d "$f" | yq -o json '.'
+}
+
+# Handle a vault file this machine's key cannot decrypt (the Type loops call
+# this BEFORE any decrypt attempt — an out-of-scope file must never even be
+# fed to sops). Encrypted for other machines → expected under per-path
+# scope: log + count, caller continues. No sops recipients at all → that is
+# not scope, it is plaintext sitting in the vault — keep dying loudly on it,
+# exactly as sync always has.
+skipped_count=0
+skip_out_of_scope() {
+  local f="$1"
+  if ! yq -e '.sops.age[0].recipient' "$f" >/dev/null 2>&1; then
+    SYNC_FAIL_REASON="$f has no sops age recipients (plaintext in the vault?) — refusing"
+    die "$SYNC_FAIL_REASON"
+  fi
+  info "  Skipping ${f#"$keyvault"/} (out of this machine's scope)"
+  skipped_count=$((skipped_count+1))
 }
 
 # Normalize a name to env-var-safe upper-snake (e.g. "foo-bar" -> "FOO_BAR").
@@ -269,20 +319,52 @@ typos pointing at \$HOME etc.).
 EOF
 chmod 600 "$staging/$AGENTKEYS_MARKER"
 
+# ---------- 2b. Enumerate vault secrets ----------
+#
+# ONE enumeration, shared with the scope generator (lib/scope.sh), so "what
+# is a vault secret" is decided in exactly one place: the whole-vault scan
+# minus CLI metadata minus gitignored plaintext, checked against find
+# failures. The per-dir globs this replaces disagreed with the generator —
+# they fed gitignored plaintext to sops -d, killing the sync on a file that
+# is not a secret. Type routing below is by path prefix; nested files and
+# non-standard top-level dirs are legitimate vault secrets (agentkeys edit
+# allows them) that sync has never materialized — keep them visible, not
+# fatal.
+if ! vault_files="$(scope_list_encrypted_files "$keyvault")"; then
+  SYNC_FAIL_REASON="could not enumerate vault files (unreadable subdirectory?)"
+  die "$SYNC_FAIL_REASON"
+fi
+
+shared_yamls=(); service_yamls=(); agent_yamls=(); file_manifests=(); unrouted_files=()
+while IFS= read -r rel; do
+  [ -n "$rel" ] || continue
+  case "$rel" in
+    shared/*/*|services/*/*|agents/*/*|files/*/*) unrouted_files+=("$rel") ;;
+    shared/*.yaml)   shared_yamls+=("$keyvault/$rel") ;;
+    services/*.yaml) service_yamls+=("$keyvault/$rel") ;;
+    agents/*.yaml)   agent_yamls+=("$keyvault/$rel") ;;
+    files/*.yaml)    file_manifests+=("$keyvault/$rel") ;;
+    *)               unrouted_files+=("$rel") ;;
+  esac
+done <<< "$vault_files"
+
+if [ ${#unrouted_files[@]} -gt 0 ]; then
+  info "  (${#unrouted_files[@]} vault file(s) outside the four Type dirs, not materialized: ${unrouted_files[*]})"
+fi
+
 # ---------- 3. Process shared/ (Type A) ----------
 
 declare -A SHARED_KV=()
 declare -A SHARED_KV_SOURCE=()   # key -> which file it came from (for collision error)
 shared_files_written=0
 
-shopt -s nullglob
-shared_yamls=( "$keyvault"/shared/*.yaml )
-shopt -u nullglob
-
 if [ ${#shared_yamls[@]} -gt 0 ]; then
   mkdir -p "$staging/shared"
   for f in "${shared_yamls[@]}"; do
     name="$(basename "$f" .yaml)"
+    if ! machine_can_decrypt "$f"; then
+      skip_out_of_scope "$f"; continue
+    fi
     if ! json="$(decrypt_to_json "$f")"; then
       SYNC_FAIL_REASON="failed to decrypt $f"
       die "$SYNC_FAIL_REASON"
@@ -326,12 +408,11 @@ declare -A SERVICES_JSON=()
 declare -A SEEN_SVC_NORM=()   # svc_upper -> original svc name (cross-service collision)
 service_token_files_written=0
 
-shopt -s nullglob
-service_yamls=( "$keyvault"/services/*.yaml )
-shopt -u nullglob
-
 for f in "${service_yamls[@]}"; do
   svc="$(basename "$f" .yaml)"
+  if ! machine_can_decrypt "$f"; then
+    skip_out_of_scope "$f"; continue
+  fi
   validate_path_component "$svc" "services/ filename"
   # Service name flows into Type B injection as `<SVC_UPPER>_AUTH_*`. After
   # normalize, the prefix must be a valid env-var start (letter/underscore),
@@ -393,14 +474,13 @@ done
 
 agent_files_written=0
 
-shopt -s nullglob
-agent_yamls=( "$keyvault"/agents/*.yaml )
-shopt -u nullglob
-
 if [ ${#agent_yamls[@]} -gt 0 ]; then
   mkdir -p "$staging/agents"
   for f in "${agent_yamls[@]}"; do
     consumer="$(basename "$f" .yaml)"
+    if ! machine_can_decrypt "$f"; then
+      skip_out_of_scope "$f"; continue
+    fi
     if ! agent_json="$(decrypt_to_json "$f")"; then
       SYNC_FAIL_REASON="failed to decrypt $f"; die "$SYNC_FAIL_REASON"
     fi
@@ -459,11 +539,10 @@ fi
 
 type_c_files_written=0
 
-shopt -s nullglob
-file_manifests=( "$keyvault"/files/*.yaml )
-shopt -u nullglob
-
 for f in "${file_manifests[@]}"; do
+  if ! machine_can_decrypt "$f"; then
+    skip_out_of_scope "$f"; continue
+  fi
   if ! json="$(decrypt_to_json "$f")"; then
     SYNC_FAIL_REASON="failed to decrypt $f"; die "$SYNC_FAIL_REASON"
   fi
@@ -537,7 +616,8 @@ cat > "$secrets_dir/.sync-state" <<EOF
     "shared": $shared_files_written,
     "service_tokens": $service_token_files_written,
     "agents": $agent_files_written,
-    "type_c_files": $type_c_files_written
+    "type_c_files": $type_c_files_written,
+    "skipped": $skipped_count
   },
   "status": "ok"
 }
@@ -550,4 +630,5 @@ info "  shared/<name>.env       : $shared_files_written"
 info "  agents/<name>.env       : $agent_files_written"
 info "  <svc>/<consumer>.token  : $service_token_files_written"
 info "  Type C files            : $type_c_files_written"
+info "  Skipped (out of scope)  : $skipped_count"
 info "  Output                  : $secrets_dir"

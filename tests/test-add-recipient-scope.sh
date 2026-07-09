@@ -181,4 +181,50 @@ ck "explicit --scope paths on key replacement applies" \
 ck "narrowed replacement key reads its path" "$(probe edge4 agents/boba.yaml)" "OK"
 ck "narrowed replacement key DENIED elsewhere" "$(probe edge4 agents/mojo.yaml)" "DENIED"
 
+# --- the load gate's remediation paths must remain runnable THROUGH
+# add-recipient (the gate must not block the very command its error message
+# recommends). Two repair scenarios:
+#
+# (a) manifest entry written ahead of registration (hand-edit): registering
+# that machine is the fix — the pre-flight must not reject it as unknown.
+( cd "$VAULT" && yq -i '.recipients.pending = "all"' "$SCOPES_FILE_NAME" )
+PENDING="$(fixture_keygen pending)"
+add pending "$PENDING" >/dev/null 2>&1 \
+  || { echo "FAIL: add-recipient should complete a manifest entry written ahead of it"; fail=1; }
+ck "pre-listed machine registered" "$(probe pending agents/mojo.yaml)" "OK"
+# ...while an entry for some OTHER unregistered machine still fails closed.
+( cd "$VAULT" && yq -i '.recipients.ghost = "all"' "$SCOPES_FILE_NAME" )
+if add another "$(fixture_keygen another)" >/dev/null 2>&1; then
+  echo "FAIL: unrelated unknown manifest entry should still block add-recipient"; fail=1
+fi
+[ ! -f "$VAULT/recipients/another.age.pub" ] || { echo "FAIL: blocked add left another.age.pub behind"; fail=1; }
+( cd "$VAULT" && yq -i 'del(.recipients.ghost)' "$SCOPES_FILE_NAME" )
+
+# (b) two machines sharing one pubkey with divergent scopes: giving one of
+# them a distinct key IS the fix — the pre-flight must tolerate the stale
+# duplicate it is about to replace.
+cp "$VAULT/recipients/edge.age.pub" "$VAULT/recipients/twin.age.pub"
+( cd "$VAULT" && yq -i '.recipients.twin = "all"' "$SCOPES_FILE_NAME" )   # edge is scoped → divergent
+TWIN="$(fixture_keygen twin)"
+printf 'y\n' | add twin "$TWIN" >/dev/null 2>&1 \
+  || { echo "FAIL: add-recipient should replace a stale duplicate key"; fail=1; }
+ck "twin got its own key" "$(cat "$VAULT/recipients/twin.age.pub")" "$TWIN"
+ck "twin (all) reads the vault" "$(probe twin agents/mojo.yaml)" "OK"
+
+# ...but the pending exemption must NOT reach the missing-recipient check:
+# rotating a registered, path-scoped machine whose manifest line was lost
+# (hand edit / merge) must keep failing closed — the default-all branch
+# would otherwise silently widen it to the whole vault.
+edge_key_before="$(cat "$VAULT/recipients/edge.age.pub")"
+( cd "$VAULT" && yq -i 'del(.recipients.edge)' "$SCOPES_FILE_NAME" )
+EDGE5="$(fixture_keygen edge5)"
+if printf 'y\n' | add edge "$EDGE5" >/dev/null 2>&1; then
+  echo "FAIL: re-keying a machine with a LOST manifest entry must fail closed, not widen to all"; fail=1
+fi
+ck "manifest not resurrected by the rejected rotation" \
+  "$(yq -r '.recipients.edge // "absent"' "$VAULT/$SCOPES_FILE_NAME")" "absent"
+ck "pubkey untouched by the rejected rotation" \
+  "$(cat "$VAULT/recipients/edge.age.pub")" "$edge_key_before"
+( cd "$VAULT" && git checkout -q -- "$SCOPES_FILE_NAME" )
+
 [ "$fail" -eq 0 ] && echo "PASS: add-recipient-scope" || exit 1

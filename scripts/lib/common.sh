@@ -135,6 +135,24 @@ age_pubkey() {
   grep "^# public key:" "$key_file" | sed 's/^# public key: //'
 }
 
+# Return 0 if this machine's age pubkey is listed among a sops-encrypted
+# file's recipients (i.e. we're expected to decrypt it). Used by sync to skip
+# out-of-scope files instead of dying on them. Reads the file's own sops.age
+# metadata (its CURRENT encrypted state), not .sops.yaml (future rules).
+#
+# NOT `yq | grep -q`: grep -q exits at its first match, and under pipefail
+# the producer's SIGPIPE (141) then fails the whole pipeline — turning a
+# POSITIVE membership hit into an intermittent false "out of scope" (seen
+# live: a 3-recipient file whose matching key sat on the first line).
+# Materialize, then match — no pipe, no SIGPIPE.
+machine_can_decrypt() {
+  local f="$1" mypub recips
+  [ -f "$(age_key_file)" ] || return 1
+  mypub="$(age_pubkey)" || return 1
+  recips="$(yq '.sops.age[].recipient' "$f" 2>/dev/null)" || return 1
+  grep -qxF "$mypub" <<< "$recips"
+}
+
 # ---------- Confirmation prompt ----------
 
 confirm() {
