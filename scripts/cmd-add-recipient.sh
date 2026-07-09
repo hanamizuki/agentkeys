@@ -163,7 +163,11 @@ info "✓ Wrote $recipient_file"
 # simple all-recipient mode.
 scopes_path="$keyvault/$SCOPES_FILE_NAME"
 if [ ! -f "$scopes_path" ]; then
-  scope_load_manifest "$keyvault" | yq -P '.' > "$scopes_path"
+  # Materialize BEFORE the redirect — `> manifest` creates the (empty)
+  # target first, flipping a piped scope_load_manifest into its
+  # validate-existing branch (see _scope_ensure_manifest in cmd-scope.sh).
+  seeded_manifest="$(scope_load_manifest "$keyvault")"
+  printf '%s\n' "$seeded_manifest" | yq -P '.' > "$scopes_path"
   info "Seeded $SCOPES_FILE_NAME (existing recipients = all — simple-mode equivalent)"
 fi
 # Write the machine's scope: an explicit --scope always applies; a brand-new
