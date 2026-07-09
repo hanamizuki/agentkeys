@@ -167,4 +167,21 @@ grep -qxF 'agents/a1.yaml' "$FIXTURE_HOME/last_commit_files" \
   && { echo "FAIL: unrelated plaintext bystander swept into the scope commit"; fail=1; }
 ck "bystander still untracked" "$(cd "$VAULT" && git status --porcelain -- agents/a1.yaml)" "?? agents/a1.yaml"
 
+# --- review fix (r13/P1-1): a TRAILING SLASH on AGENTKEYS_KEYVAULT must not
+# corrupt the scope change. find_keyvault_root used to return the raw value;
+# scope_list_encrypted_files strips "$keyvault/" TEXTUALLY off find output,
+# so 'vault//' never matched 'vault/…': paths stayed absolute, the metadata
+# exclusions missed, .sops.yaml gained absolute-path rules, real files were
+# skipped by updatekeys — and the revocation this scope set asks for
+# (dropping agents/a[1].yaml from edge) silently did not happen, rc=0.
+( cd "$VAULT" && AGE_KEY_FILE="$FIXTURE_HOME/keys/core.txt" AGENTKEYS_KEYVAULT="$VAULT/" \
+    bash "$REPO/agentkeys" scope set edge agents/boba.yaml ) >/dev/null 2>&1 \
+  || { echo "FAIL: scope set with trailing-slash keyvault errored"; fail=1; }
+# NB: can't grep -F for $FIXTURE_HOME — regex atoms escape '.' (tmp\.xxx).
+# The invariant: no generated path_regex may anchor on an ABSOLUTE path.
+ck "no absolute paths leak into .sops.yaml" "$(grep -cE "path_regex: '\^\(/" "$VAULT/.sops.yaml")" "0"
+ck "kept grant survives trailing-slash set"  "$(probe edge agents/boba.yaml)" "OK"
+ck "revocation applies despite trailing slash" "$(probe edge 'agents/a[1].yaml')" "DENIED"
+ck "unrelated file intact after trailing-slash set" "$(probe core agents/mojo.yaml)" "OK"
+
 [ "$fail" -eq 0 ] && echo "PASS: scope-mutate" || exit 1

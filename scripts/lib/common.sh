@@ -50,11 +50,18 @@ find_keyvault_root() {
   _looks_like_vault() {
     [ -d "$1" ] && [ -f "$1/.sops.yaml" ] && [ -d "$1/recipients" ] && [ -d "$1/shared" ]
   }
+  # The returned path is used in TEXT comparisons downstream — e.g.
+  # scope_list_encrypted_files strips "$keyvault/" off find output as a
+  # string. A trailing slash (AGENTKEYS_KEYVAULT=/vault/) broke that strip:
+  # paths stayed absolute, metadata exclusions missed, .sops.yaml gained
+  # absolute-path rules and updatekeys skipped the real files — a scope
+  # change (revocation!) could "succeed" without re-encrypting anything.
+  # So every return goes through the shell's canonical form.
+  _canon_dir() { ( CDPATH='' cd -- "$1" 2>/dev/null && pwd ); }
 
   # 1. Explicit env override
   if [ -n "${AGENTKEYS_KEYVAULT:-}" ]; then
-    if _looks_like_vault "$AGENTKEYS_KEYVAULT"; then
-      echo "$AGENTKEYS_KEYVAULT"
+    if _looks_like_vault "$AGENTKEYS_KEYVAULT" && _canon_dir "$AGENTKEYS_KEYVAULT"; then
       return 0
     fi
     err "AGENTKEYS_KEYVAULT='$AGENTKEYS_KEYVAULT' is not a keyvault (missing .sops.yaml, recipients/, or shared/)"
@@ -65,8 +72,8 @@ find_keyvault_root() {
   local dir="${1:-$PWD}"
   while [ "$dir" != "/" ] && [ -n "$dir" ]; do
     if _looks_like_vault "$dir"; then
-      echo "$dir"
-      return 0
+      _canon_dir "$dir" && return 0
+      return 1
     fi
     dir="$(dirname "$dir")"
   done
@@ -83,8 +90,8 @@ find_keyvault_root() {
       printf '%s' "${AGENTKEYS_KEYVAULT:-}"
     )"
     if [ -n "$cfg_vault" ] && _looks_like_vault "$cfg_vault"; then
-      echo "$cfg_vault"
-      return 0
+      _canon_dir "$cfg_vault" && return 0
+      return 1
     fi
   fi
 
