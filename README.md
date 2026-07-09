@@ -54,7 +54,7 @@ $ agentkeys rotate OPENAI_API_KEY
 
 | Tool | Where agentkeys differs |
 |---|---|
-| Raw [sops](https://github.com/getsops/sops) + [age](https://github.com/FiloSottile/age) | 4-Type taxonomy, composition rules, rotation playbook, agent adapters |
+| Raw [sops](https://github.com/getsops/sops) + [age](https://github.com/FiloSottile/age) | 4-Type taxonomy, composition rules, per-path recipient scope (outward-facing machines decrypt only their subset), rotation playbook, agent adapters |
 | [chezmoi](https://www.chezmoi.io/) | Focused on secrets (not dotfiles), fine-grained recipients + cross-machine sync |
 | [git-crypt](https://github.com/AGWA/git-crypt) | sops selective field encryption + multiple recipients + fine-grained access |
 | [HashiCorp Vault](https://www.vaultproject.io/) | No daemon, no cloud account, pure local + git |
@@ -69,18 +69,20 @@ $ agentkeys rotate OPENAI_API_KEY
 | Command | Status |
 |---|---|
 | `agentkeys init <path>` | ✅ Implemented |
-| `agentkeys add-recipient <name>` | ✅ Implemented |
+| `agentkeys add-recipient <name> [--scope all\|path,…]` | ✅ Implemented |
 | `agentkeys edit <path>` | ✅ Implemented |
 | `agentkeys sync` | ✅ Implemented |
 | `agentkeys status` | ✅ Implemented |
 | `agentkeys rotate <key>` | ✅ Implemented |
+| `agentkeys scope <show\|set\|regen>` | ✅ Implemented |
 
 ### Verified end-to-end
 
 - sops + age encryption round-trip (encrypt → decrypt → match)
-- `.sops.yaml` rules auto-applied (recipients picked up from `recipients/`)
+- `.sops.yaml` rules generated from `.agentkeys-scopes.yaml` (deterministic; scoped machine provably loses/gains access on `scope set`)
+- Scope-limited sync: out-of-scope files skipped before any decrypt attempt, full-scope machines unaffected
 - `sops filestatus` reports encrypted state
-- 12+ adversarial test cases (path traversal, newline injection, normalize collisions, bash 3.2 re-exec)
+- 12+ adversarial test cases (path traversal, newline injection, normalize collisions, bash 3.2 re-exec), plus fault-injection and SIGPIPE-regression suites for the scope layer
 
 ### Roadmap
 
