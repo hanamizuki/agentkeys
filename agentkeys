@@ -56,6 +56,7 @@ COMMANDS:
   sync                              Pull + decrypt to ~/.secrets/
   status                            Show stale state, last sync, errors
   rotate <KEY_NAME>                 Rotate a secret end-to-end (interactive)
+  scope <show|set|regen>            Inspect / change per-path decrypt scope
   version                           Print version
   help                              Show this help
 
@@ -88,6 +89,7 @@ case "$cmd" in
   sync)          exec "$BASH" "$SCRIPTS_DIR/cmd-sync.sh" "$@" ;;
   status)        exec "$BASH" "$SCRIPTS_DIR/cmd-status.sh" "$@" ;;
   rotate)        exec "$BASH" "$SCRIPTS_DIR/cmd-rotate.sh" "$@" ;;
+  scope)         exec "$BASH" "$SCRIPTS_DIR/cmd-scope.sh" "$@" ;;
   version|--version|-v) echo "agentkeys $VERSION" ;;
   help|--help|-h) usage ;;
   *)

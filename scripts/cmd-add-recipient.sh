@@ -7,6 +7,13 @@ set -euo pipefail
 
 # shellcheck source=lib/common.sh
 source "${AGENTKEYS_LIB_DIR:-$(dirname "${BASH_SOURCE[0]}")/lib}/common.sh"
+source "${AGENTKEYS_LIB_DIR:-$(dirname "${BASH_SOURCE[0]}")/lib}/scope.sh"
+
+# Safety net: any unexpected death between _scope_begin and _scope_end
+# (set -e, die, environment failure) restores the entry snapshot. Installed
+# here at the cmd layer — the dispatcher execs this script, so the trap
+# never leaks to a parent, and tests sourcing lib/scope.sh keep their own.
+trap '_scope_exit_trap' EXIT
 
 usage() {
   cat <<EOF
@@ -21,11 +28,17 @@ ARGUMENTS:
   <machine-name>     Alphanumeric/dash/underscore identifier (e.g. "laptop")
   [pubkey-or-file]   age1... string OR path to a file containing the pubkey
 
+OPTIONS:
+  --scope all|path,path,...   Decrypt scope for this machine (default: all).
+                              Exact vault-relative paths, comma-separated.
+
 EFFECTS:
   1. Writes pubkey to <keyvault>/recipients/<machine-name>.age.pub
-  2. Updates .sops.yaml creation_rules to include this recipient
-  3. Re-encrypts existing yaml files (sops updatekeys)
-  4. Commits the change
+  2. Records the machine's scope in .agentkeys-scopes.yaml
+  3. Regenerates .sops.yaml from the manifest (preserves existing per-path
+     scoping — does NOT revert to simple all-recipient mode)
+  4. Re-encrypts existing yaml files (sops updatekeys)
+  5. Commits the change
 
 EXAMPLES:
   # On this machine, using ~/.age/key.txt
@@ -39,12 +52,16 @@ EXAMPLES:
 EOF
 }
 
-machine="${1:-}"
-pubkey_input="${2:-}"
-
-case "$machine" in
-  ""|-h|--help|help) usage; exit 0 ;;
-esac
+machine=""; pubkey_input=""; scope_spec="all"; scope_explicit=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help|help) usage; exit 0 ;;
+    --scope) [ $# -ge 2 ] || die "--scope needs a value (all | path,path,...)"; scope_spec="$2"; scope_explicit=1; shift 2 ;;
+    -*) die "Unknown option: $1" ;;
+    *) if [ -z "$machine" ]; then machine="$1"; elif [ -z "$pubkey_input" ]; then pubkey_input="$1"; else die "Unexpected arg: $1"; fi; shift ;;
+  esac
+done
+[ -n "$machine" ] || { usage; exit 0; }
 
 # Validate machine name
 if ! [[ "$machine" =~ ^[a-zA-Z0-9_-]+$ ]]; then
@@ -89,6 +106,13 @@ recipient_file="$keyvault/recipients/$machine.age.pub"
 if [ -f "$recipient_file" ]; then
   existing="$(cat "$recipient_file")"
   if [ "$existing" = "$pubkey" ]; then
+    # A same-pubkey re-run is a no-op ONLY when no explicit scope was
+    # requested. Any explicit --scope (including 'all', a widen request on a
+    # scoped machine) is a scope-change ask — don't silently succeed while
+    # leaving access unchanged; point at scope set.
+    if [ "$scope_explicit" = "1" ]; then
+      die "Recipient $machine already registered. To change its scope, run: agentkeys scope set $machine $scope_spec"
+    fi
     info "Recipient $machine already registered with same pubkey. No-op."
     exit 0
   fi
@@ -98,134 +122,86 @@ if [ -f "$recipient_file" ]; then
   confirm "Overwrite?" || die "Aborted"
 fi
 
+# Pre-flight, BEFORE anything is written: an invalid existing manifest or a
+# vault-escaping --scope path must be rejected while the tree is still
+# untouched. (Previously an invalid manifest made yq -i die under set -e
+# after the pubkey was already on disk but before any rollback existed —
+# a half-onboarded vault.) After this point every mutation is covered by
+# the _scope_begin snapshot.
+scope_load_manifest "$keyvault" >/dev/null \
+  || die "Fix $SCOPES_FILE_NAME before adding a recipient (see error above)."
+scope_spec_validate "$scope_spec"
+
+# Count unique recipient keys pre-write (commit message + <3-keys warning).
+# Reading recipients/*.age.pub can fail (unreadable file); computing it here
+# — post-write state simulated as existing keys minus this machine's old
+# file plus the incoming key — keeps that failure BEFORE the first mutation
+# instead of a set -e death mid-onboarding.
+existing_keys="$(for f in "$keyvault"/recipients/*.age.pub; do
+    [ -f "$f" ] || continue
+    [ "$f" = "$recipient_file" ] && continue
+    cat "$f" || exit 1
+  done)" || die "Cannot read a file under recipients/ — fix permissions and retry."
+unique_keys="$(printf '%s\n%s\n' "$existing_keys" "$pubkey" | LC_ALL=C sort -u | grep -c '^age1')"
+
+# Snapshot the vault's entry state — on any failure, scope_apply restores
+# exactly this state: the pubkey file we're about to write, a manifest we
+# may seed below, and every on-disk encrypted file (tracked or not). No
+# half-onboarded vault, no destroyed hand-edits.
+_scope_begin "$keyvault" "recipients/$machine.age.pub"
+
 echo "$pubkey" > "$recipient_file"
 info "✓ Wrote $recipient_file"
 
-# Collect all recipients
-all_pubkeys=()
-for f in "$keyvault"/recipients/*.age.pub; do
-  [ -f "$f" ] && all_pubkeys+=("$(cat "$f")")
-done
-
-# Dedup + sort
-mapfile -t all_pubkeys < <(printf "%s\n" "${all_pubkeys[@]}" | sort -u)
-
-age_csv="$(IFS=,; echo "${all_pubkeys[*]}")"
-
-# Rewrite .sops.yaml
-cat > "$keyvault/.sops.yaml" <<EOF
-# .sops.yaml — encryption rules for this keyvault repo
-#
-# Managed by 'agentkeys add-recipient'. Don't edit by hand unless you know
-# what you're doing — use 'agentkeys add-recipient <machine>' instead.
-#
-# Current mode: simple (all recipients can decrypt all files).
-# Future: per-file recipient differentiation for finer access control.
-
-creation_rules:
-  # Type C file manifests: encrypt only content field (paths/modes visible for audit)
-  - path_regex: '^files/.*\.yaml\$'
-    encrypted_regex: '^(content)\$'
-    age: $age_csv
-
-  # Everything else: encrypt all values
-  - path_regex: '\.yaml\$'
-    age: $age_csv
-EOF
-
-info "✓ Updated .sops.yaml with ${#all_pubkeys[@]} recipient(s)"
-
-# Re-encrypt existing encrypted files. Track exactly which files we touched
-# so the commit only contains our changes — never use `git add -u` here,
-# which would sweep in any other tracked modifications the user happened to
-# have in the working tree (a real risk because cron / parallel sessions
-# can leave the keyvault dirty).
-#
-# If any updatekeys fails (file unreadable, this machine isn't in the prior
-# recipient list, sops config drift, etc.) we abort and roll back .sops.yaml
-# + the new recipient pubkey. Partial onboarding silently committed would
-# leave the new machine unable to decrypt some files but the .sops.yaml
-# claiming it can — a half-baked vault state that's hard to spot until the
-# new machine actually tries to read those secrets.
-encrypted_count=0
-re_encrypted_files=()
-failed_files=()
-while IFS= read -r f; do
-  [ -z "$f" ] && continue
-  case "$f" in
-    *"/.sops.yaml"|*"/recipients/"*) continue ;;
+# Record this machine's scope in the manifest (source of truth). Seed it from
+# current recipients first on a pre-scope vault, so behavior matches the old
+# simple mode before we layer in this machine. Regeneration PRESERVES existing
+# per-path scoping — adding a machine must never silently revert the vault to
+# simple all-recipient mode.
+scopes_path="$keyvault/$SCOPES_FILE_NAME"
+if [ ! -f "$scopes_path" ]; then
+  scope_load_manifest "$keyvault" | yq -P '.' > "$scopes_path"
+  info "Seeded $SCOPES_FILE_NAME (existing recipients = all — simple-mode equivalent)"
+fi
+# Write the machine's scope: an explicit --scope always applies; a brand-new
+# machine defaults to "all"; a machine ALREADY in the manifest (key
+# replacement/rotation) keeps its existing scope — re-keying a path-scoped
+# machine without repeating --scope must not silently widen it to the vault.
+if [ "$scope_explicit" = "1" ]; then
+  scope_manifest_set_machine "$scopes_path" "$machine" "$scope_spec"
+else
+  # Probe WITHOUT -e and read the value: yq -e exits 1 for both "not in the
+  # manifest" and "could not read/parse the manifest", so an IO error used
+  # to fall through to the default-all branch — an error widening a
+  # machine's access. A read failure dies instead (the EXIT trap restores
+  # the entry state).
+  has_entry="$(yq ".recipients | has(\"$machine\")" "$scopes_path")" \
+    || die "Cannot read $SCOPES_FILE_NAME — aborting."
+  case "$has_entry" in
+    false) scope_manifest_set_machine "$scopes_path" "$machine" "all" ;;
+    true)  info "Keeping existing scope for $machine (pass --scope to change it)" ;;
+    *)     die "Unexpected result probing $SCOPES_FILE_NAME for '$machine': $has_entry" ;;
   esac
-  if sops filestatus "$f" 2>/dev/null | grep -q '"encrypted":\s*true'; then
-    info "  Re-encrypting $(realpath --relative-to="$keyvault" "$f" 2>/dev/null || echo "$f")"
-    if sops updatekeys -y "$f" 2>/dev/null; then
-      encrypted_count=$((encrypted_count + 1))
-      re_encrypted_files+=("$f")
-    else
-      failed_files+=("$f")
-    fi
-  fi
-done < <(find "$keyvault" -type f -name "*.yaml" 2>/dev/null)
-
-if [ ${#failed_files[@]} -gt 0 ]; then
-  err "sops updatekeys failed for ${#failed_files[@]} file(s):"
-  for f in "${failed_files[@]}"; do
-    err "  - $(realpath --relative-to="$keyvault" "$f" 2>/dev/null || echo "$f")"
-  done
-  err ""
-  err "Rolling back to keep the vault consistent: restoring .sops.yaml and"
-  err "removing recipients/$machine.age.pub. Any files already re-encrypted"
-  err "in this run will also be restored from HEAD."
-  # Restore .sops.yaml from HEAD if it's tracked (true after `init` did its
-  # initial commit). Worst case: it's not tracked and we can't restore — but
-  # that only happens on a fresh init before first add-recipient, where
-  # there's nothing to re-encrypt anyway.
-  if git -C "$keyvault" cat-file -e HEAD:.sops.yaml 2>/dev/null; then
-    git -C "$keyvault" checkout HEAD -- .sops.yaml
-  fi
-  # Recipient file: if it existed in HEAD (i.e. we OVERWROTE an existing
-  # pubkey for this machine), restore the previous version. If it was brand
-  # new in this run, just delete it.
-  rel_recipient="${recipient_file#$keyvault/}"
-  if git -C "$keyvault" cat-file -e "HEAD:$rel_recipient" 2>/dev/null; then
-    git -C "$keyvault" checkout HEAD -- "$rel_recipient"
-  else
-    rm -f "$recipient_file"
-  fi
-  for f in "${re_encrypted_files[@]}"; do
-    rel="${f#$keyvault/}"
-    if git -C "$keyvault" cat-file -e "HEAD:$rel" 2>/dev/null; then
-      git -C "$keyvault" checkout HEAD -- "$rel"
-    fi
-  done
-  die "Recipient onboarding aborted — vault state restored."
 fi
 
-[ "$encrypted_count" -gt 0 ] && info "✓ Re-encrypted $encrypted_count file(s)"
-
-# Commit — stage only the exact files we wrote/changed. Never `git add
-# recipients/` (whole dir): if another session left an untracked or modified
-# pubkey for a different machine, that would be swept into this commit.
-cd "$keyvault"
-git add -- "recipients/$machine.age.pub" .sops.yaml
-if [ ${#re_encrypted_files[@]} -gt 0 ]; then
-  git add -- "${re_encrypted_files[@]}"
-fi
-git commit -q -m "add recipient: $machine
+# The shared write path (lib/scope.sh): regenerate .sops.yaml from the
+# manifest, re-encrypt every ruled file, commit with an exact pathspec. Dies
+# after restoring the entry snapshot if anything fails.
+scope_apply "$keyvault" "add recipient: $machine
 
 Pubkey: $pubkey
-Total recipients: ${#all_pubkeys[@]}"
+Total recipients: $unique_keys" "recipients/$machine.age.pub"
 
-info "✓ Committed"
 info ""
-info "Recipients registered (${#all_pubkeys[@]}):"
+info "Recipients registered:"
 for f in "$keyvault"/recipients/*.age.pub; do
-  name="$(basename "$f" .age.pub)"
-  info "  - $name"
+  info "  - $(basename "$f" .age.pub)"
 done
 
-# Warn if < 3 (per spec §7)
-if [ "${#all_pubkeys[@]}" -lt 3 ]; then
+# Warn if < 3 unique keys (spec §7) — duplicate pubkeys across machines add
+# no recovery redundancy, so count keys, not machine names.
+if [ "$unique_keys" -lt 3 ]; then
   warn ""
-  warn "⚠ Only ${#all_pubkeys[@]} recipient(s). Spec recommends ≥3 for emergency recovery."
+  warn "⚠ Only $unique_keys unique recipient key(s). Spec recommends ≥3 for emergency recovery."
   warn "  Add more with: agentkeys add-recipient <name>"
 fi
