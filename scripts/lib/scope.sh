@@ -19,6 +19,14 @@ _scope_faultpoint() {
   if [ "${AGENTKEYS_FAULT:-}" = "$1" ]; then exit 97; fi
 }
 
+# True if sops ITSELF reports the file as encrypted. Metadata presence is
+# not the same thing: a stale/forged sops.age block over plaintext values
+# has recipients but no encryption — filestatus fails or reports false for
+# those. Single line out, so the grep -q pipe has no SIGPIPE surface.
+sops_file_encrypted() {
+  sops filestatus "$1" 2>/dev/null | grep -q '"encrypted":[[:space:]]*true'
+}
+
 # Escape a vault-relative path into an anchored-alternation-safe regex atom.
 # Escapes EVERY RE2 metacharacter (sops uses Go's regexp) so a filename with
 # e.g. '+' or '[' maps to an exact path_regex instead of a pattern that could
@@ -491,7 +499,7 @@ scope_apply() {
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     [ -f "$keyvault/$f" ] || continue
-    if sops filestatus "$keyvault/$f" 2>/dev/null | grep -q '"encrypted":[[:space:]]*true'; then
+    if sops_file_encrypted "$keyvault/$f"; then
       # cd: sops updatekeys resolves .sops.yaml from cwd, not the file's dir.
       if ( cd "$keyvault" && sops updatekeys -y "$f" >/dev/null 2>&1 ); then
         touched+=("$f")

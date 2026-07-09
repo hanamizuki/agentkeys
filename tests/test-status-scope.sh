@@ -59,6 +59,17 @@ has "plaintext flagged in the scope section" "$out_plain" "NOT sops-encrypted"
 has "plaintext line names the file"          "$out_plain" "agents/plain.yaml"
 rm -f "$VAULT/agents/plain.yaml"
 
+# Stale/forged sops metadata over plaintext values must not render as ✓ —
+# only a file sops ITSELF reports encrypted counts as decryptable. (The
+# metadata names edge's key, so a metadata-presence check would say ✓.)
+printf 'K: plainvalue\nsops:\n  age:\n    - recipient: %s\n      enc: fake\n  version: 3.8.0\n' "$EDGE" \
+  > "$VAULT/agents/forged.yaml"
+out_forged="$(AGE_KEY_FILE="$FIXTURE_HOME/keys/edge.txt" AGENTKEYS_KEYVAULT="$VAULT" \
+  bash "$REPO/agentkeys" status 2>&1)" || { echo "FAIL: status with forged metadata exited non-zero"; fail=1; }
+has   "forged metadata flagged as not encrypted" "$out_forged" "⚠ agents/forged.yaml"
+hasnt "forged metadata must not show as ✓"       "$out_forged" "✓ agents/forged.yaml"
+rm -f "$VAULT/agents/forged.yaml"
+
 # STALE with >20 pending commits must not kill status mid-output: the old
 # `git log | head -20` let head exit early, git log took SIGPIPE (141), and
 # pipefail+set -e aborted before the recipients/scope sections printed.

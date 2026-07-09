@@ -171,13 +171,15 @@ if [ -n "$keyvault" ] && [ -f "$(age_key_file)" ]; then
     any=0
     while IFS= read -r f; do
       [ -n "$f" ] || continue
-      if machine_can_decrypt "$keyvault/$f"; then
-        printf '  ✓ %s\n' "$f"; any=1
-      elif ! yq -e '.sops.age[0].recipient' "$keyvault/$f" >/dev/null 2>&1; then
-        # No sops recipients at all: NOT "out of this machine's scope" — it
-        # is plaintext sitting in the vault, readable by every machine.
-        # Omitting it would read as "this machine can't touch that file".
+      # Genuinely-encrypted first (sops filestatus, not metadata presence:
+      # a stale/forged sops.age block over plaintext values must not show
+      # as ✓). A file that is NOT encrypted is not "out of scope" either —
+      # it is plaintext sitting in the vault, readable by every machine;
+      # omitting it would read as "this machine can't touch that file".
+      if ! sops_file_encrypted "$keyvault/$f"; then
         printf '  ⚠ %s — NOT sops-encrypted (plaintext, readable by anyone)\n' "$f"; any=1
+      elif machine_can_decrypt "$keyvault/$f"; then
+        printf '  ✓ %s\n' "$f"; any=1
       fi
     done <<< "$listed"
     [ "$any" = "1" ] || echo "  (decrypts nothing — not a recipient of any file)"
