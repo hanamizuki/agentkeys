@@ -8,6 +8,9 @@ set -euo pipefail
 
 # shellcheck source=lib/common.sh
 source "${AGENTKEYS_LIB_DIR:-$(dirname "${BASH_SOURCE[0]}")/lib}/common.sh"
+# scope.sh provides scope_list_encrypted_files for the decrypt-scope section.
+# status never opens a scope transaction — no _scope_exit_trap here.
+source "${AGENTKEYS_LIB_DIR:-$(dirname "${BASH_SOURCE[0]}")/lib}/scope.sh"
 
 usage() {
   cat <<EOF
@@ -93,6 +96,7 @@ if [ -f "$state_file" ]; then
   echo "    agents:        $(jq -r '.breakdown.agents // 0' "$state_file")"
   echo "    service tokens: $(jq -r '.breakdown.service_tokens // 0' "$state_file")"
   echo "    type-c files:  $(jq -r '.breakdown.type_c_files // 0' "$state_file")"
+  echo "    skipped:       $(jq -r '.breakdown.skipped // 0' "$state_file")"
   echo ""
 
   # --- staleness check ---
@@ -103,7 +107,12 @@ if [ -f "$state_file" ]; then
     else
       echo "⚠ STALE — keyvault HEAD ($head_sha) differs from synced ($commit_sha)"
       if [ "$head_sha" != "unknown" ] && [ "$commit_sha" != "unknown" ]; then
-        pending="$(cd "$keyvault" && git log --oneline "$commit_sha..$head_sha" 2>/dev/null | head -20)"
+        # git's own -20, NOT `| head -20`: head exits after 20 lines, and on
+        # a long-enough pending list git log is still writing — SIGPIPE(141)
+        # + pipefail + set -e killed status mid-output right here (recipients
+        # and scope sections never printed). || true keeps an unknown synced
+        # sha silently omitting the list, as the old pipeline's rc did.
+        pending="$(cd "$keyvault" && git log --oneline -20 "$commit_sha..$head_sha" 2>/dev/null || true)"
         if [ -n "$pending" ]; then
           echo "  Pending commits:"
           echo "$pending" | sed 's/^/    /'
@@ -143,6 +152,26 @@ if [ -n "$keyvault" ]; then
     if [ "${#recipients[@]}" -lt 3 ]; then
       echo "  ⚠ Less than 3 recipients — spec §7 recommends ≥3 for recovery."
     fi
+  fi
+fi
+
+# --- this machine's decrypt scope ---
+if [ -n "$keyvault" ] && [ -f "$(age_key_file)" ]; then
+  echo ""
+  echo "──────────────────────────────────────────────"
+  echo "This machine's decrypt scope:"
+  # Materialized, not `while ... < <(scope_list...)`: a scan failure inside a
+  # process substitution is invisible and would render as a shorter-than-real
+  # list — status is a diagnostic surface, say "couldn't scan" instead.
+  if listed="$(scope_list_encrypted_files "$keyvault")"; then
+    any=0
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      if machine_can_decrypt "$keyvault/$f"; then printf '  ✓ %s\n' "$f"; any=1; fi
+    done <<< "$listed"
+    [ "$any" = "1" ] || echo "  (decrypts nothing — not a recipient of any file)"
+  else
+    echo "  ⚠ (could not scan the vault — see error above)"
   fi
 fi
 
