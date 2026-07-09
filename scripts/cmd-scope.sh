@@ -45,7 +45,13 @@ cd "$keyvault"   # sops updatekeys resolves .sops.yaml from cwd
 # pre-scope vault upgrades smoothly the first time scope is mutated.
 _scope_ensure_manifest() {
   [ -f "$keyvault/$SCOPES_FILE_NAME" ] && return
-  scope_load_manifest "$keyvault" | yq -P '.' > "$keyvault/$SCOPES_FILE_NAME"
+  # Materialize BEFORE the redirect: `> manifest` creates the (empty) target
+  # before the pipeline runs, so a piped scope_load_manifest would see the
+  # file exist, take the validate-existing branch, and die on it as
+  # malformed — killing every first mutation of a pre-scope vault.
+  local seeded
+  seeded="$(scope_load_manifest "$keyvault")"
+  printf '%s\n' "$seeded" | yq -P '.' > "$keyvault/$SCOPES_FILE_NAME"
   info "Seeded $SCOPES_FILE_NAME (all recipients = all)"
 }
 
