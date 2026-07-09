@@ -146,4 +146,39 @@ ck "explicit --scope all on key replacement widens" \
   "$(yq -o json '.recipients.edge' "$VAULT/$SCOPES_FILE_NAME" | jq -c .)" '"all"'
 ck "widened replacement key reads mojo" "$(probe edge3 agents/mojo.yaml)" "OK"
 
+# --- P0 (set-e dead spot): the unique-key count reads every recipients/*.age.pub;
+# an unreadable sibling pubkey file makes that read fail. It used to run AFTER
+# the pubkey + manifest were written (post-mutation, pre-commit) — pipefail
+# died there and stranded a half-onboarded vault. It must fail BEFORE any write.
+chmod 000 "$VAULT/recipients/third.age.pub"
+NINTH="$(fixture_keygen ninth)"
+if add ninth "$NINTH" >/dev/null 2>&1; then
+  echo "FAIL: add-recipient with an unreadable sibling pubkey should exit non-zero"; fail=1
+fi
+chmod 644 "$VAULT/recipients/third.age.pub"
+[ ! -f "$VAULT/recipients/ninth.age.pub" ] || { echo "FAIL: unreadable-pubkey add left ninth.age.pub behind"; fail=1; }
+ck "manifest has no ninth after unreadable-pubkey add" \
+  "$(yq -o json '.recipients.ninth // "absent"' "$VAULT/$SCOPES_FILE_NAME" | jq -c .)" '"absent"'
+
+# --- decision-matrix lock (P0): new machine + EXPLICIT --scope all must land
+# as "all" — same outcome as the default, but through the explicit branch,
+# which must not regress independently.
+TENTH="$(fixture_keygen tenth)"
+add tenth "$TENTH" --scope all >/dev/null 2>&1 \
+  || { echo "FAIL: new machine with explicit --scope all errored"; fail=1; }
+ck "explicit --scope all on a new machine lands as all" \
+  "$(yq -o json '.recipients.tenth' "$VAULT/$SCOPES_FILE_NAME" | jq -c .)" '"all"'
+ck "explicitly-all new machine reads the vault" "$(probe tenth agents/mojo.yaml)" "OK"
+
+# --- decision-matrix lock (P0): key replacement (different pubkey, confirmed
+# overwrite) + EXPLICIT --scope paths must APPLY the new paths — not keep the
+# old scope, not widen. edge is "all" (edge3) at this point; narrow it.
+EDGE4="$(fixture_keygen edge4)"
+printf 'y\n' | add edge "$EDGE4" --scope agents/boba.yaml >/dev/null 2>&1 \
+  || { echo "FAIL: key replacement with explicit --scope paths errored"; fail=1; }
+ck "explicit --scope paths on key replacement applies" \
+  "$(yq -o json '.recipients.edge' "$VAULT/$SCOPES_FILE_NAME" | jq -c .)" '["agents/boba.yaml"]'
+ck "narrowed replacement key reads its path" "$(probe edge4 agents/boba.yaml)" "OK"
+ck "narrowed replacement key DENIED elsewhere" "$(probe edge4 agents/mojo.yaml)" "DENIED"
+
 [ "$fail" -eq 0 ] && echo "PASS: add-recipient-scope" || exit 1

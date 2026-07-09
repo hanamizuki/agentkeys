@@ -9,6 +9,12 @@ set -euo pipefail
 source "${AGENTKEYS_LIB_DIR:-$(dirname "${BASH_SOURCE[0]}")/lib}/common.sh"
 source "${AGENTKEYS_LIB_DIR:-$(dirname "${BASH_SOURCE[0]}")/lib}/scope.sh"
 
+# Safety net: any unexpected death between _scope_begin and _scope_end
+# (set -e, die, environment failure) restores the entry snapshot. Installed
+# here at the cmd layer — the dispatcher execs this script, so the trap
+# never leaks to a parent, and tests sourcing lib/scope.sh keep their own.
+trap '_scope_exit_trap' EXIT
+
 usage() {
   cat <<EOF
 Usage: agentkeys add-recipient <machine-name> [pubkey-or-file]
@@ -126,6 +132,18 @@ scope_load_manifest "$keyvault" >/dev/null \
   || die "Fix $SCOPES_FILE_NAME before adding a recipient (see error above)."
 scope_spec_validate "$scope_spec"
 
+# Count unique recipient keys pre-write (commit message + <3-keys warning).
+# Reading recipients/*.age.pub can fail (unreadable file); computing it here
+# — post-write state simulated as existing keys minus this machine's old
+# file plus the incoming key — keeps that failure BEFORE the first mutation
+# instead of a set -e death mid-onboarding.
+existing_keys="$(for f in "$keyvault"/recipients/*.age.pub; do
+    [ -f "$f" ] || continue
+    [ "$f" = "$recipient_file" ] && continue
+    cat "$f" || exit 1
+  done)" || die "Cannot read a file under recipients/ — fix permissions and retry."
+unique_keys="$(printf '%s\n%s\n' "$existing_keys" "$pubkey" | LC_ALL=C sort -u | grep -c '^age1')"
+
 # Snapshot the vault's entry state — on any failure, scope_apply restores
 # exactly this state: the pubkey file we're about to write, a manifest we
 # may seed below, and every on-disk encrypted file (tracked or not). No
@@ -151,16 +169,24 @@ fi
 # machine without repeating --scope must not silently widen it to the vault.
 if [ "$scope_explicit" = "1" ]; then
   scope_manifest_set_machine "$scopes_path" "$machine" "$scope_spec"
-elif ! yq -e ".recipients | has(\"$machine\")" "$scopes_path" >/dev/null 2>&1; then
-  scope_manifest_set_machine "$scopes_path" "$machine" "all"
 else
-  info "Keeping existing scope for $machine (pass --scope to change it)"
+  # Probe WITHOUT -e and read the value: yq -e exits 1 for both "not in the
+  # manifest" and "could not read/parse the manifest", so an IO error used
+  # to fall through to the default-all branch — an error widening a
+  # machine's access. A read failure dies instead (the EXIT trap restores
+  # the entry state).
+  has_entry="$(yq ".recipients | has(\"$machine\")" "$scopes_path")" \
+    || die "Cannot read $SCOPES_FILE_NAME — aborting."
+  case "$has_entry" in
+    false) scope_manifest_set_machine "$scopes_path" "$machine" "all" ;;
+    true)  info "Keeping existing scope for $machine (pass --scope to change it)" ;;
+    *)     die "Unexpected result probing $SCOPES_FILE_NAME for '$machine': $has_entry" ;;
+  esac
 fi
 
 # The shared write path (lib/scope.sh): regenerate .sops.yaml from the
 # manifest, re-encrypt every ruled file, commit with an exact pathspec. Dies
 # after restoring the entry snapshot if anything fails.
-unique_keys="$(cat "$keyvault"/recipients/*.age.pub | LC_ALL=C sort -u | grep -c '^age1')"
 scope_apply "$keyvault" "add recipient: $machine
 
 Pubkey: $pubkey

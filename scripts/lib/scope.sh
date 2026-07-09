@@ -11,6 +11,14 @@
 
 SCOPES_FILE_NAME=".agentkeys-scopes.yaml"
 
+# Test-only fault injection: AGENTKEYS_FAULT=<point> aborts execution at the
+# named point the way an unexpected environment failure under set -e would
+# (immediate exit, no cleanup), so tests can prove the EXIT-trap safety net
+# actually restores the entry snapshot. Never set outside tests.
+_scope_faultpoint() {
+  if [ "${AGENTKEYS_FAULT:-}" = "$1" ]; then exit 97; fi
+}
+
 # Escape a vault-relative path into an anchored-alternation-safe regex atom.
 # Escapes EVERY RE2 metacharacter (sops uses Go's regexp) so a filename with
 # e.g. '+' or '[' maps to an exact path_regex instead of a pattern that could
@@ -226,12 +234,22 @@ scope_machine_allows() {
 # invisible to a checkout-HEAD rollback. So: snapshot every file an apply may
 # write BEFORE the caller mutates anything, restore that snapshot on failure.
 
+# Transaction state, set/reset by _scope_begin / _scope_end and read by
+# _scope_exit_trap. SNAP_DIR non-empty = a transaction is open.
+SCOPE_SNAP_DIR=""
+SCOPE_SNAP_VAULT=""
+SCOPE_SNAP_READY=0     # 1 only once the entry snapshot is COMPLETE
+SCOPE_COMMITTED=0      # 1 once scope_apply's git commit has landed
+
 # _scope_begin <keyvault> [extra vault-relative paths...]
 # Snapshot .sops.yaml + the manifest + every encrypted-eligible yaml on disk
 # (+ extras, e.g. the recipient pubkey add-recipient is about to write). A
 # path absent at entry is recorded so restore deletes it.
 _scope_begin() {
   local keyvault="$1"; shift
+  SCOPE_SNAP_READY=0
+  SCOPE_COMMITTED=0
+  SCOPE_SNAP_VAULT="$keyvault"
   SCOPE_SNAP_DIR="$(mktemp -d)"
   local f
   { printf '%s\n' ".sops.yaml" "$SCOPES_FILE_NAME" "$@"
@@ -242,25 +260,80 @@ _scope_begin() {
     mkdir -p "$SCOPE_SNAP_DIR/data/$(dirname "$f")"
     cp -p "$keyvault/$f" "$SCOPE_SNAP_DIR/data/$f"
   done < "$SCOPE_SNAP_DIR/paths"
+  # Only now is restoring safe: a snapshot that died mid-copy would make
+  # _scope_restore_entry's absent-in-data branch DELETE the original files.
+  SCOPE_SNAP_READY=1
 }
 
-# Restore every snapshotted path to its entry state (delete what didn't exist).
+# Restore every snapshotted path to its entry state (delete what didn't
+# exist). Best-effort: one failing copy must not stop the rest of the
+# restore (under set -e it used to), so collect failures, finish the loop,
+# and report — non-zero means the caller must keep the snapshot dir, it
+# holds the only copy of the entry state for the failed paths.
 _scope_restore_entry() {
-  local keyvault="$1" f
+  local keyvault="$1" f failed=""
   [ -n "${SCOPE_SNAP_DIR:-}" ] && [ -f "$SCOPE_SNAP_DIR/paths" ] || return 0
   while IFS= read -r f; do
     if [ -f "$SCOPE_SNAP_DIR/data/$f" ]; then
-      cp -p "$SCOPE_SNAP_DIR/data/$f" "$keyvault/$f"
+      cp -p "$SCOPE_SNAP_DIR/data/$f" "$keyvault/$f" 2>/dev/null || failed="$failed $f"
     else
-      rm -f "$keyvault/$f"
+      rm -f "$keyvault/$f" 2>/dev/null || failed="$failed $f"
     fi
   done < "$SCOPE_SNAP_DIR/paths"
+  if [ -n "$failed" ]; then
+    warn "⚠ Could not restore:$failed — recover them manually from $SCOPE_SNAP_DIR/data/"
+    return 1
+  fi
+  return 0
 }
 
-# Discard the snapshot (on success, or after a restore).
+# Discard the snapshot (on success, or after a restore). Disarm the EXIT
+# trap FIRST (clear the variables), THEN best-effort remove the dir: the old
+# order let a failing rm leave the trap armed, mis-restoring a transaction
+# that had already succeeded.
 _scope_end() {
-  [ -n "${SCOPE_SNAP_DIR:-}" ] && rm -rf "$SCOPE_SNAP_DIR"
+  local dir="${SCOPE_SNAP_DIR:-}"
   SCOPE_SNAP_DIR=""
+  SCOPE_SNAP_VAULT=""
+  SCOPE_SNAP_READY=0
+  SCOPE_COMMITTED=0
+  if [ -n "$dir" ]; then rm -rf "$dir" 2>/dev/null || true; fi
+  return 0
+}
+
+# EXIT-trap safety net. Installed by the cmd scripts (cmd-scope.sh,
+# cmd-add-recipient.sh) right after sourcing this lib — NOT installed here:
+# tests source this file and own their EXIT traps, and cmd-edit/cmd-sync
+# carry their own. Catches any death between _scope_begin and _scope_end
+# that the explicit _scope_fail guards didn't (set -e on an unguarded line,
+# die from a helper, a killed subcommand) and restores the entry snapshot.
+# Written as plain if-blocks: under set -e a failing && tail in a trap would
+# abort the handler and clobber the script's real exit code.
+_scope_exit_trap() {
+  if [ -z "${SCOPE_SNAP_DIR:-}" ]; then return 0; fi   # no open transaction
+  # Commit landed: the tree already IS the committed state — restoring now
+  # would rewind the work tree behind HEAD. Drop the snapshot, keep the tree.
+  if [ "${SCOPE_COMMITTED:-0}" = "1" ]; then
+    rm -rf "$SCOPE_SNAP_DIR" 2>/dev/null || true
+    SCOPE_SNAP_DIR=""
+    return 0
+  fi
+  # Snapshot incomplete (_scope_begin itself died): nothing was mutated yet
+  # (begin runs before any write), and restoring from a partial snapshot
+  # would delete files whose copy never happened. Drop it, restore nothing.
+  if [ "${SCOPE_SNAP_READY:-0}" != "1" ]; then
+    rm -rf "$SCOPE_SNAP_DIR" 2>/dev/null || true
+    SCOPE_SNAP_DIR=""
+    return 0
+  fi
+  warn "Unexpected exit mid scope-change — restoring the entry state."
+  if _scope_restore_entry "$SCOPE_SNAP_VAULT"; then
+    rm -rf "$SCOPE_SNAP_DIR" 2>/dev/null || true
+  else
+    warn "⚠ Restore incomplete — entry snapshot kept at $SCOPE_SNAP_DIR (data/ holds the entry-state files)."
+  fi
+  SCOPE_SNAP_DIR=""
+  return 0
 }
 
 # scope_apply <keyvault> <commit-msg> [extra commit paths...]
@@ -276,15 +349,38 @@ _scope_end() {
 scope_apply() {
   local keyvault="$1" msg="$2"; shift 2
   [ -n "${SCOPE_SNAP_DIR:-}" ] || die "internal: scope_apply called without _scope_begin"
-  _scope_fail() { _scope_restore_entry "$keyvault"; _scope_end; die "$1"; }
+  _scope_fail() {
+    if _scope_restore_entry "$keyvault"; then
+      _scope_end
+    else
+      # Partial restore: keep the snapshot (its data/ is the only copy of
+      # the entry state) but disarm the EXIT trap — it would only re-fail.
+      warn "⚠ Entry snapshot kept at $SCOPE_SNAP_DIR for manual recovery."
+      SCOPE_SNAP_DIR=""
+    fi
+    die "$1"
+  }
   if ! emit_sops_rules "$keyvault" > "$keyvault/.sops.yaml.tmp"; then
-    rm -f "$keyvault/.sops.yaml.tmp"
+    # The cleanup itself must not out-die the rollback below (set -e).
+    rm -f "$keyvault/.sops.yaml.tmp" 2>/dev/null || true
     _scope_fail "Refusing to write .sops.yaml — see error above (fix $SCOPES_FILE_NAME)."
   fi
-  mv "$keyvault/.sops.yaml.tmp" "$keyvault/.sops.yaml"
+  if ! mv "$keyvault/.sops.yaml.tmp" "$keyvault/.sops.yaml"; then
+    rm -f "$keyvault/.sops.yaml.tmp" 2>/dev/null || true
+    _scope_fail "Could not replace .sops.yaml — restored the pre-command state, no commit."
+  fi
   local thin
   thin="$(awk -F': ' '/^    age:/{n=gsub(/,/,",",$2)+1; if(n<3) print n}' "$keyvault/.sops.yaml" | head -1 || true)"
   [ -n "$thin" ] && warn "⚠ A generated rule has < 3 recipients — emergency recovery at risk (spec §7)."
+  # Compute the ruled-path list up front and CHECK it: a producer failing
+  # inside `done < <(...)` is silently swallowed — fail-open, files missing
+  # from the list would simply skip re-encryption while .sops.yaml already
+  # claims the new rules. SCOPE_SNAP_DIR doubles as scratch space; it lives
+  # exactly as long as this transaction.
+  local ruled_list="$SCOPE_SNAP_DIR/ruled-paths"
+  if ! scope_all_ruled_paths "$keyvault" > "$ruled_list"; then
+    _scope_fail "Could not compute the ruled-path list — restored the pre-command state, no commit."
+  fi
   local f; local -a touched=()
   while IFS= read -r f; do
     [ -n "$f" ] || continue
@@ -297,7 +393,8 @@ scope_apply() {
         _scope_fail "sops updatekeys failed for $f — are you on a machine that can decrypt everything? Restored the pre-command state, no commit."
       fi
     fi
-  done < <(scope_all_ruled_paths "$keyvault")
+  done < "$ruled_list"
+  _scope_faultpoint post-updatekeys
   local -a paths=(.sops.yaml "$SCOPES_FILE_NAME" "$@")
   [ ${#touched[@]} -gt 0 ] && paths+=("${touched[@]}")
   # Git pathspecs treat [], *, ? as fnmatch globs — a vault filename like
@@ -311,6 +408,11 @@ scope_apply() {
   # pathspec so unrelated staged work is untouched), then roll back.
   if ! git -C "$keyvault" add -- "${lit[@]}" 2>/dev/null; then
     git -C "$keyvault" reset -q -- "${lit[@]}" 2>/dev/null || true
+    # The reset above is best-effort (|| true) — if IT failed too, a partial
+    # add may linger in the shared index; say so instead of leaving it silent.
+    if ! git -C "$keyvault" diff --cached --quiet -- "${lit[@]}" 2>/dev/null; then
+      warn "⚠ Some scope paths are still staged (git index busy?) — run: git -C $keyvault reset -- <paths>"
+    fi
     _scope_fail "git add failed for the scope change — restored the pre-command state, no commit."
   fi
   # No-op (re-setting the same scope, or regen right after add-recipient):
@@ -322,8 +424,14 @@ scope_apply() {
   fi
   if ! git -C "$keyvault" commit -q -m "$msg" -- "${lit[@]}"; then
     git -C "$keyvault" reset -q -- "${lit[@]}" 2>/dev/null || true
+    if ! git -C "$keyvault" diff --cached --quiet -- "${lit[@]}" 2>/dev/null; then
+      warn "⚠ Some scope paths are still staged (git index busy?) — run: git -C $keyvault reset -- <paths>"
+    fi
     _scope_fail "git commit failed for the scope change — restored the pre-command state."
   fi
+  # From here the commit is the truth: a death before _scope_end must NOT
+  # restore the entry tree (HEAD would advance while the tree rewinds).
+  SCOPE_COMMITTED=1
   _scope_end
   info "✓ ${msg%%$'\n'*} (re-encrypted ${#touched[@]} file(s))"
 }

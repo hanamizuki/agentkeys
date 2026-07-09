@@ -11,6 +11,12 @@ set -euo pipefail
 source "${AGENTKEYS_LIB_DIR:-$(dirname "${BASH_SOURCE[0]}")/lib}/common.sh"
 source "${AGENTKEYS_LIB_DIR:-$(dirname "${BASH_SOURCE[0]}")/lib}/scope.sh"
 
+# Safety net: any unexpected death between _scope_begin and _scope_end
+# (set -e, die, environment failure) restores the entry snapshot. Installed
+# here at the cmd layer — the dispatcher execs this script, so the trap
+# never leaks to a parent, and tests sourcing lib/scope.sh keep their own.
+trap '_scope_exit_trap' EXIT
+
 usage() {
   cat <<EOF
 Usage: agentkeys scope <show|set|regen> [args]
