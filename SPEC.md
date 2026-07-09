@@ -291,39 +291,114 @@ done
 
 ## 7. Recipients and `.sops.yaml`
 
-Per-file access control: each file's `path_regex` lists which machines can decrypt it.
+Per-file access control: each encrypted file carries exactly the recipient
+set whose scope covers it. `.sops.yaml` expresses that as `path_regex` →
+`age:` rules — but it is a **generated artifact**, never hand-edited.
+
+### 7.1 Source of truth: `.agentkeys-scopes.yaml`
+
+The source of truth for who can decrypt what is `.agentkeys-scopes.yaml` at
+the vault root (plaintext — it holds no secrets, only machine→path
+mappings):
 
 ```yaml
-# .sops.yaml
-creation_rules:
-  # Shared: all active machines can decrypt
-  - path_regex: shared/.*\.yaml$
-    age: >-
-      age1machine-a...,
-      age1machine-b...,
-      age1machine-c...,
-      age1machine-d...
-
-  # Per-consumer file: only machines that run this consumer
-  - path_regex: agents/<agent-a>\.yaml$
-    age: <machine-A>,<machine-B>,<machine-C>   # ≥3 write recipients
-
-  # Service file: depends on where its consumers live
-  - path_regex: services/<service-X>\.yaml$
-    age: <machine-A>,<machine-B>,<machine-C>
-
-  # File manifest: only machines that consume those files
-  - path_regex: files/ssh-keys\.yaml$
-    age: <machine-A>,<machine-B>
-
-  # Encryption regex for file manifests
-  - path_regex: files/.*\.yaml$
-    encrypted_regex: '^(content)$'
+version: 1
+recipients:
+  core-machine: all                  # decrypts the whole vault
+  edge-machine:                      # decrypts ONLY these exact paths
+    - agents/boba.yaml
+    - shared/model-providers-boba.yaml
+    - files/gcp-sa-ethtaipei.yaml
 ```
+
+Scope values are `all` or an array of **exact vault-relative paths** (not
+globs — exact-match keeps the security boundary unambiguous). A machine
+listed with an array is fail-closed: newly added files are NOT auto-granted
+to it.
+
+The manifest and `recipients/*.age.pub` must describe the SAME machine set,
+both ways: a manifest that exists but omits a registered machine is a load
+error (a hand edit or merge that loses a line must fail closed, not default
+that machine to `all`), and a manifest entry with no registered pubkey is a
+load error too. Only a MISSING manifest file defaults every registered
+machine to `all` (the pre-scope legacy-vault upgrade path). One pubkey
+registered under several machine names must have identical scopes —
+decrypt capability is key-level, so the widest scope would silently win.
+
+### 7.2 Generation
+
+`agentkeys` computes, for each encrypted file, the set of recipients whose
+scope covers it, groups files by identical recipient set, and emits one
+`creation_rule` per group. `files/` rules (carrying `encrypted_regex:
+'^(content)$'`) are emitted first because they also match a bare `\.yaml$`.
+Fallback rules (granted to the `all`-scope machines only) keep a NEW file
+encryptable before the next regen. Output is deterministic (sorted) so
+drift is detectable.
+
+Never hand-edit `.sops.yaml`. Change scope via:
+
+```
+agentkeys add-recipient <m> --scope all|path,path    # new machine
+agentkeys scope set <m> <all|path,path>              # existing machine
+# or: edit .agentkeys-scopes.yaml, then: agentkeys scope regen
+```
+
+`scope set`/`regen`/`add-recipient` run `sops updatekeys`, which must
+decrypt each file first — **run them on a machine whose key can decrypt
+everything** (a full-scope/`all` machine). Running on a scope-limited
+machine aborts before commit; any failure restores the entry-state snapshot
+(including uncommitted manifest hand-edits and untracked encrypted files).
+
+`agentkeys sync` on a scope-limited machine skips the files it is not a
+recipient of (recorded as `skipped` in `.sync-state`) instead of dying on
+the first undecryptable file; `agentkeys status` shows the resulting scope.
+
+### 7.3 File splitting for scope boundaries
+
+sops encrypts at file granularity: every entry in one file shares one
+recipient set. When entries within a file need different scopes, split the
+file.
+
+**Type C (files/):** one manifest = one recipient set. If
+`files/gcp-sa.yaml` holds both an ethtaipei SA (an edge machine needs it)
+and a mojo SA (it must not), split into `files/gcp-sa-ethtaipei.yaml` and
+`files/gcp-sa-mojo.yaml`. Naming: `<group>-<scope>.yaml`.
+
+**Type A (shared/):** a shared file is a single recipient set too, but its
+keys also compose into every agent's env. To give an edge machine only a
+subset of `shared/model-providers.yaml`, MOVE (do not copy) that subset
+into `shared/model-providers-<scope>.yaml` — copying would trip the "same
+key in two shared files" guard (§4.3). The edge machine's scope then lists
+only the subset file; it never decrypts the parent file.
+
+**Split recipe (run on a full-scope machine).** Steps 1–2 must land as ONE
+commit: in between, the moved keys exist in both files, and any sync that
+sees that state trips the §4.3 duplicate shared-key guard. So decline the
+per-edit commit prompts and commit both sides together:
+
+```
+# 1. Create the subset file with the moved keys — decline the commit prompt
+agentkeys edit shared/model-providers-boba   # add MINIMAX/OPENROUTER/... keys
+# 2. Remove those keys from the parent — decline again
+agentkeys edit shared/model-providers        # delete the moved keys
+# 3. Commit BOTH sides atomically
+cd <keyvault> && \
+  git add -- shared/model-providers.yaml shared/model-providers-boba.yaml && \
+  git commit -m "split model-providers: move boba subset out"
+# 4. Grant the edge machine the subset (+ its other in-scope files)
+agentkeys scope set edge agents/boba.yaml,shared/model-providers-boba.yaml,files/gcp-sa-ethtaipei.yaml
+# 5. Verify: edge decrypts subset, not parent
+#    (on the edge machine) agentkeys status  → scope section
+```
+
+(A cron sync on the SAME machine can still land between steps 1 and 2 —
+sync reads the working tree — and will fail on the duplicate guard. That
+failure is safe: the previous `~/.secrets` cache is kept, `.sync-error` is
+written, and the next run after step 3 self-heals.)
 
 ### Critical rule: ≥3 write recipients per file
 
-If only 2 machines can decrypt+edit a file, the "both write machines down" disaster scenario is unrecoverable. **Default to ≥3 write recipients** so a third machine can always run `sops updatekeys` to recover.
+If only 2 machines can decrypt+edit a file, the "both write machines down" disaster scenario is unrecoverable. **Default to ≥3 write recipients** so a third machine can always run `sops updatekeys` to recover. The generator warns when a generated rule carries fewer than 3.
 
 ---
 
@@ -428,6 +503,20 @@ If you only had 2 write recipients (you shouldn't have), this is **unsolvable**.
 
 If you have ≥3: pick any surviving write-capable machine, recover from there.
 
+### Rolling back a scope change
+
+The vault is a git repo, so any scope change is one `git revert` away:
+
+```
+cd <keyvault>
+git revert --no-edit <scope-commit-sha>   # restores .sops.yaml + manifest
+agentkeys scope regen                     # re-encrypt to the restored manifest
+```
+
+Run on a full-scope machine. `scope regen` re-runs `sops updatekeys` for
+every ruled file, so the reverted recipient sets actually reach the files
+(reverting the metadata alone does NOT re-key anything).
+
 ---
 
 ## 11. Security hardening
@@ -529,12 +618,15 @@ Three blocks:
 ### CLI surface
 
 ```
-agentkeys sync                # Pull + decrypt now
-agentkeys status              # Show stale machines, last sync times, errors
+agentkeys sync                # Pull + decrypt now (skips out-of-scope files)
+agentkeys status              # Stale state, errors, this machine's decrypt scope
 agentkeys edit <path>         # Wrap sops edit + commit + push
 agentkeys rotate <KEY_NAME>   # Locate, edit, push, sync, reload, audit log
 agentkeys add-file <src> <dest>  # Encrypt a file into manifest (planned)
-agentkeys add-recipient <machine> <pubkey>   # Register new machine
+agentkeys add-recipient <machine> <pubkey> [--scope all|path,...]   # Register new machine
+agentkeys scope show [machine]               # Inspect decrypt scopes
+agentkeys scope set <machine> <all|path,...> # Change a machine's scope + re-encrypt
+agentkeys scope regen                        # Regenerate .sops.yaml from the manifest
 agentkeys emergency-revoke <machine>          # Remove machine, re-encrypt, rotate (planned)
 ```
 

@@ -5,6 +5,47 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added — per-path recipient scope (2026-07-08/09)
+
+- `.agentkeys-scopes.yaml` (vault root, plaintext): source of truth mapping
+  each machine to `all` or an exact list of decryptable paths.
+- `scripts/lib/scope.sh`: deterministic `.sops.yaml` generator (per-file
+  recipient sets, files/ rules first, sorted output), entry-state snapshot
+  rollback for every scope mutation, and a fail-closed enumeration layer
+  (unreadable/malformed pubkeys, unknown/omitted manifest machines,
+  interrupted vault scans, and shared-key scope divergence all abort
+  loudly instead of silently shrinking a recipient set).
+- `agentkeys scope show|set|regen`: inspect / change decrypt scope.
+- `agentkeys add-recipient <m> --scope all|path,path`: register a machine
+  with a decrypt scope; regenerates `.sops.yaml` from the manifest
+  (idempotent — adding a machine no longer reverts existing per-path
+  layering to simple mode).
+- `agentkeys sync` skips files this machine is not a recipient of (was:
+  aborted on the first undecryptable file), records a `skipped` count in
+  `.sync-state`, and validates post-pull that the local key is a
+  registered recipient (an unregistered or unreadable key fails loudly
+  instead of skipping the whole vault into an "ok" empty cache). A
+  committed plaintext yaml still aborts the sync.
+- `agentkeys status` shows this machine's decrypt scope and the skipped
+  count.
+- `agentkeys init` seeds an empty `.agentkeys-scopes.yaml`.
+- Test harness: `tests/lib/vault-fixture.sh` + `tests/run-all.sh` (8 test
+  files, throwaway-vault fixtures, mutation-tested assertions).
+
+### Fixed — pre-scope bugs caught while building it
+
+- `add-recipient` now `cd`s into the keyvault before `sops updatekeys`,
+  fixing a config-not-found rollback when the keyvault is a sub-directory
+  of the invocation cwd.
+- `find_keyvault_root` canonicalizes to the physical path: a trailing
+  slash or symlinked `AGENTKEYS_KEYVAULT` used to desync the file scan
+  from the vault root, silently skipping re-encryption (a revocation
+  could report success without re-keying anything).
+- `status` no longer dies mid-output (exit 141, recipients section lost)
+  on a stale vault whose pending list exceeds 20 commits: `git log |
+  head -20` let head's early exit SIGPIPE git log under pipefail; git's
+  own `-20` replaces the pipe.
+
 ### Fixed — Day 3 post-Codex-review (2026-05-16)
 
 Day 3 patch was iterated through **10 rounds of `codex review --uncommitted`** until clean ("no discrete bugs"). 15 distinct issues caught and fixed across the bash CLI; this section is the consolidated changelog.
