@@ -371,18 +371,30 @@ into `shared/model-providers-<scope>.yaml` — copying would trip the "same
 key in two shared files" guard (§4.3). The edge machine's scope then lists
 only the subset file; it never decrypts the parent file.
 
-**Split recipe (run on a full-scope machine):**
+**Split recipe (run on a full-scope machine).** Steps 1–2 must land as ONE
+commit: in between, the moved keys exist in both files, and any sync that
+sees that state trips the §4.3 duplicate shared-key guard. So decline the
+per-edit commit prompts and commit both sides together:
 
 ```
-# 1. Create the subset file with the moved keys
+# 1. Create the subset file with the moved keys — decline the commit prompt
 agentkeys edit shared/model-providers-boba   # add MINIMAX/OPENROUTER/... keys
-# 2. Remove those keys from the parent
+# 2. Remove those keys from the parent — decline again
 agentkeys edit shared/model-providers        # delete the moved keys
-# 3. Grant the edge machine the subset (+ its other in-scope files)
+# 3. Commit BOTH sides atomically
+cd <keyvault> && \
+  git add -- shared/model-providers.yaml shared/model-providers-boba.yaml && \
+  git commit -m "split model-providers: move boba subset out"
+# 4. Grant the edge machine the subset (+ its other in-scope files)
 agentkeys scope set edge agents/boba.yaml,shared/model-providers-boba.yaml,files/gcp-sa-ethtaipei.yaml
-# 4. Verify: edge decrypts subset, not parent
+# 5. Verify: edge decrypts subset, not parent
 #    (on the edge machine) agentkeys status  → scope section
 ```
+
+(A cron sync on the SAME machine can still land between steps 1 and 2 —
+sync reads the working tree — and will fail on the duplicate guard. That
+failure is safe: the previous `~/.secrets` cache is kept, `.sync-error` is
+written, and the next run after step 3 self-heals.)
 
 ### Critical rule: ≥3 write recipients per file
 
