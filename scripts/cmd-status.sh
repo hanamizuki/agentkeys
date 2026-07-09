@@ -163,23 +163,30 @@ if [ -n "$keyvault" ] && [ -f "$(age_key_file)" ]; then
   # Materialized, not `while ... < <(scope_list...)`: a scan failure inside a
   # process substitution is invisible and would render as a shorter-than-real
   # list — status is a diagnostic surface, say "couldn't scan" instead.
-  if ! command -v yq >/dev/null 2>&1; then
-    # Without yq, machine_can_decrypt fails for every file — that would
-    # render as "decrypts nothing", a false security diagnosis.
-    echo "  ⚠ (yq not installed — cannot inspect recipients)"
+  if ! command -v yq >/dev/null 2>&1 || ! command -v sops >/dev/null 2>&1; then
+    # Without yq, machine_can_decrypt fails for every file (false "decrypts
+    # nothing"); without sops, every file would misreport as plaintext.
+    # Tool absence is not a file state — say so instead.
+    echo "  ⚠ (yq and sops required — cannot inspect)"
   elif listed="$(scope_list_encrypted_files "$keyvault")"; then
     any=0
     while IFS= read -r f; do
       [ -n "$f" ] || continue
-      # Genuinely-encrypted first (sops filestatus, not metadata presence:
-      # a stale/forged sops.age block over plaintext values must not show
-      # as ✓). A file that is NOT encrypted is not "out of scope" either —
-      # it is plaintext sitting in the vault, readable by every machine;
-      # omitting it would read as "this machine can't touch that file".
-      if ! sops_file_encrypted "$keyvault/$f"; then
-        printf '  ⚠ %s — NOT sops-encrypted (plaintext, readable by anyone)\n' "$f"; any=1
-      elif machine_can_decrypt "$keyvault/$f"; then
-        printf '  ✓ %s\n' "$f"; any=1
+      # Three states per file, judged by sops itself (not metadata
+      # presence — a stale/forged sops.age block over plaintext values
+      # must not show as ✓):
+      #   encrypted   → ✓ when this machine is a recipient, else omitted
+      #   plaintext   → flagged loudly: NOT "out of scope", readable by all
+      #   unreadable  → filestatus failed (malformed metadata?) — flag too
+      if fs="$(sops filestatus "$keyvault/$f" 2>/dev/null)"; then
+        case "$fs" in
+          *'"encrypted":'*true*)
+            if machine_can_decrypt "$keyvault/$f"; then printf '  ✓ %s\n' "$f"; any=1; fi ;;
+          *)
+            printf '  ⚠ %s — NOT sops-encrypted (plaintext, readable by anyone)\n' "$f"; any=1 ;;
+        esac
+      else
+        printf '  ⚠ %s — cannot inspect (malformed sops metadata?)\n' "$f"; any=1
       fi
     done <<< "$listed"
     [ "$any" = "1" ] || echo "  (decrypts nothing — not a recipient of any file)"
