@@ -56,8 +56,11 @@ find_keyvault_root() {
   # paths stayed absolute, metadata exclusions missed, .sops.yaml gained
   # absolute-path rules and updatekeys skipped the real files — a scope
   # change (revocation!) could "succeed" without re-encrypting anything.
-  # So every return goes through the shell's canonical form.
-  _canon_dir() { ( CDPATH='' cd -- "$1" 2>/dev/null && pwd ); }
+  # So every return goes through the shell's canonical form. PHYSICAL
+  # (pwd -P): find does not recurse into a bare symlink operand (-P is its
+  # default), so a logical symlink path would make the vault file scan come
+  # back empty — same silent-revocation failure through another door.
+  _canon_dir() { ( CDPATH='' cd -- "$1" 2>/dev/null && pwd -P ); }
 
   # 1. Explicit env override
   if [ -n "${AGENTKEYS_KEYVAULT:-}" ]; then

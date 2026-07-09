@@ -184,4 +184,22 @@ ck "kept grant survives trailing-slash set"  "$(probe edge agents/boba.yaml)" "O
 ck "revocation applies despite trailing slash" "$(probe edge 'agents/a[1].yaml')" "DENIED"
 ck "unrelated file intact after trailing-slash set" "$(probe core agents/mojo.yaml)" "OK"
 
+# --- review fix (r13/P2): a SYMLINK vault path must resolve to the physical
+# dir. find does not recurse into a bare symlink operand (-P default), so a
+# logically-canonicalized symlink keyvault made scope_list_encrypted_files
+# come back EMPTY: files not listed in any manifest array lost their exact
+# rules, and a revocation (drop a path from a machine) skipped updatekeys on
+# the dropped file — old recipient kept access, rc=0.
+( cd "$VAULT" && AGE_KEY_FILE="$FIXTURE_HOME/keys/core.txt" AGENTKEYS_KEYVAULT="$VAULT" \
+    bash "$REPO/agentkeys" scope set edge 'agents/boba.yaml,agents/a[1].yaml' ) >/dev/null 2>&1
+ck "grant before symlink revoke" "$(probe edge 'agents/a[1].yaml')" "OK"
+ln -s "$VAULT" "$FIXTURE_HOME/vlink"
+( cd "$FIXTURE_HOME" && AGE_KEY_FILE="$FIXTURE_HOME/keys/core.txt" AGENTKEYS_KEYVAULT="$FIXTURE_HOME/vlink" \
+    bash "$REPO/agentkeys" scope set edge agents/boba.yaml ) >/dev/null 2>&1 \
+  || { echo "FAIL: scope set via symlink keyvault errored"; fail=1; }
+ck "revocation applies via symlink keyvault" "$(probe edge 'agents/a[1].yaml')" "DENIED"
+ck "kept grant survives symlink revoke" "$(probe edge agents/boba.yaml)" "OK"
+ck "unlisted file keeps its exact rule (find recursed)" \
+  "$(grep -c 'agents/mojo' "$VAULT/.sops.yaml")" "1"
+
 [ "$fail" -eq 0 ] && echo "PASS: scope-mutate" || exit 1
