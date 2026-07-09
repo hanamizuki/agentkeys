@@ -163,11 +163,22 @@ if [ -n "$keyvault" ] && [ -f "$(age_key_file)" ]; then
   # Materialized, not `while ... < <(scope_list...)`: a scan failure inside a
   # process substitution is invisible and would render as a shorter-than-real
   # list — status is a diagnostic surface, say "couldn't scan" instead.
-  if listed="$(scope_list_encrypted_files "$keyvault")"; then
+  if ! command -v yq >/dev/null 2>&1; then
+    # Without yq, machine_can_decrypt fails for every file — that would
+    # render as "decrypts nothing", a false security diagnosis.
+    echo "  ⚠ (yq not installed — cannot inspect recipients)"
+  elif listed="$(scope_list_encrypted_files "$keyvault")"; then
     any=0
     while IFS= read -r f; do
       [ -n "$f" ] || continue
-      if machine_can_decrypt "$keyvault/$f"; then printf '  ✓ %s\n' "$f"; any=1; fi
+      if machine_can_decrypt "$keyvault/$f"; then
+        printf '  ✓ %s\n' "$f"; any=1
+      elif ! yq -e '.sops.age[0].recipient' "$keyvault/$f" >/dev/null 2>&1; then
+        # No sops recipients at all: NOT "out of this machine's scope" — it
+        # is plaintext sitting in the vault, readable by every machine.
+        # Omitting it would read as "this machine can't touch that file".
+        printf '  ⚠ %s — NOT sops-encrypted (plaintext, readable by anyone)\n' "$f"; any=1
+      fi
     done <<< "$listed"
     [ "$any" = "1" ] || echo "  (decrypts nothing — not a recipient of any file)"
   else

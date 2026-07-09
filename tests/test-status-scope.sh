@@ -48,6 +48,17 @@ out_stranger="$(AGE_KEY_FILE="$FIXTURE_HOME/keys/stranger.txt" AGENTKEYS_KEYVAUL
   bash "$REPO/agentkeys" status 2>&1)" || { echo "FAIL: status as stranger exited non-zero"; fail=1; }
 has "stranger told it decrypts nothing" "$out_stranger" "decrypts nothing"
 
+# A plaintext yaml in the vault is NOT "out of this machine's scope" — it is
+# readable by everyone. The scope section must flag it loudly, not silently
+# omit it (an operator would read the omission as "this machine can't touch
+# that file").
+echo 'PLAIN: oops' > "$VAULT/agents/plain.yaml"
+out_plain="$(AGE_KEY_FILE="$FIXTURE_HOME/keys/edge.txt" AGENTKEYS_KEYVAULT="$VAULT" \
+  bash "$REPO/agentkeys" status 2>&1)" || { echo "FAIL: status with a plaintext yaml exited non-zero"; fail=1; }
+has "plaintext flagged in the scope section" "$out_plain" "NOT sops-encrypted"
+has "plaintext line names the file"          "$out_plain" "agents/plain.yaml"
+rm -f "$VAULT/agents/plain.yaml"
+
 # STALE with >20 pending commits must not kill status mid-output: the old
 # `git log | head -20` let head exit early, git log took SIGPIPE (141), and
 # pipefail+set -e aborted before the recipients/scope sections printed.
