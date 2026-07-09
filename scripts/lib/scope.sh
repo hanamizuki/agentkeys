@@ -198,10 +198,17 @@ scope_load_manifest() {
   # assignment is where that failure becomes fatal for every scope operation.
   local rcp
   rcp="$(scope_read_recipients "$keyvault")" || return 1
+  # The pending machine's CURRENT key line is excluded from the
+  # duplicate-pubkey comparison only (rcp_dup) — that key is the thing
+  # add-recipient is about to replace. The missing-recipient check below
+  # still sees the FULL set: a registered, path-scoped machine whose
+  # manifest line was lost must keep failing closed even while being
+  # re-keyed, or the default-all branch would widen it to the whole vault.
+  local rcp_dup="$rcp"
   if [ -n "$pending" ]; then
     # awk -v (not a regex) — the name has been validated by the caller, but
     # keep the match literal regardless.
-    rcp="$(printf '%s\n' "$rcp" | awk -F'\t' -v m="$pending" '$1 != m')"
+    rcp_dup="$(printf '%s\n' "$rcp" | awk -F'\t' -v m="$pending" '$1 != m')"
   fi
   if [ -f "$p" ]; then
     # Fail closed on a malformed manifest: bad YAML, a missing/renamed
@@ -258,8 +265,9 @@ scope_load_manifest() {
     # ONLY while their scopes agree: scope is machine-name keyed but decrypt
     # capability is KEY-level — every rule listing either name carries the
     # same key, so a divergence would let the wider scope silently win for
-    # both. (Runs after the two set checks above, so every name in $rcp is
-    # known to have a manifest entry.)
+    # both. Iterates rcp_dup (pending machine's stale key excluded — it is
+    # about to be replaced); the set checks above guarantee every remaining
+    # name has a manifest entry.
     local _dn _dp _ds
     local -A _pub_owner=() _pub_scope=()
     while IFS=$'\t' read -r _dn _dp; do
@@ -271,7 +279,7 @@ scope_load_manifest() {
         return 1
       fi
       _pub_owner[$_dp]="$_dn"; _pub_scope[$_dp]="$_ds"
-    done <<< "$rcp"
+    done <<< "$rcp_dup"
     # Reject scope paths that are not vault secrets. Two families:
     #  - the CLI-managed metadata files (same exclusions as the file scan) —
     #    they are never sops-encrypted, and ruling one would feed it to

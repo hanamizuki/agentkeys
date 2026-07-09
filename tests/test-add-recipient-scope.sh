@@ -211,4 +211,20 @@ printf 'y\n' | add twin "$TWIN" >/dev/null 2>&1 \
 ck "twin got its own key" "$(cat "$VAULT/recipients/twin.age.pub")" "$TWIN"
 ck "twin (all) reads the vault" "$(probe twin agents/mojo.yaml)" "OK"
 
+# ...but the pending exemption must NOT reach the missing-recipient check:
+# rotating a registered, path-scoped machine whose manifest line was lost
+# (hand edit / merge) must keep failing closed — the default-all branch
+# would otherwise silently widen it to the whole vault.
+edge_key_before="$(cat "$VAULT/recipients/edge.age.pub")"
+( cd "$VAULT" && yq -i 'del(.recipients.edge)' "$SCOPES_FILE_NAME" )
+EDGE5="$(fixture_keygen edge5)"
+if printf 'y\n' | add edge "$EDGE5" >/dev/null 2>&1; then
+  echo "FAIL: re-keying a machine with a LOST manifest entry must fail closed, not widen to all"; fail=1
+fi
+ck "manifest not resurrected by the rejected rotation" \
+  "$(yq -r '.recipients.edge // "absent"' "$VAULT/$SCOPES_FILE_NAME")" "absent"
+ck "pubkey untouched by the rejected rotation" \
+  "$(cat "$VAULT/recipients/edge.age.pub")" "$edge_key_before"
+( cd "$VAULT" && git checkout -q -- "$SCOPES_FILE_NAME" )
+
 [ "$fail" -eq 0 ] && echo "PASS: add-recipient-scope" || exit 1
