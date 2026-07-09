@@ -128,7 +128,10 @@ fi
 # after the pubkey was already on disk but before any rollback existed —
 # a half-onboarded vault.) After this point every mutation is covered by
 # the _scope_begin snapshot.
-scope_load_manifest "$keyvault" >/dev/null \
+# $machine is passed as the pending machine: ITS manifest entry / stale
+# duplicate key must not block the registration that fixes them; the
+# post-add state is re-validated inside scope_apply (with rollback).
+scope_load_manifest "$keyvault" "$machine" >/dev/null \
   || die "Fix $SCOPES_FILE_NAME before adding a recipient (see error above)."
 scope_spec_validate "$scope_spec"
 

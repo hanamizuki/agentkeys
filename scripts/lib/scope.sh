@@ -176,11 +176,21 @@ scope_list_encrypted_files() {
 
 # Load manifest as JSON. Missing file → synthesize all-"all" from recipients
 # (simple-mode equivalent; smooth upgrade from a pre-scope vault).
+#
+# scope_load_manifest <keyvault> [pending-machine]
+# pending-machine: add-recipient is ABOUT to (re)register this machine, so
+# its pubkey and scope are decided by the operation in progress — exclude it
+# from the cross-set consistency checks below, or the gate would block the
+# very remediations its own errors recommend (registering a machine whose
+# manifest entry was hand-written first; replacing a stale duplicate key).
+# The post-add state is fully re-validated by the load inside scope_apply,
+# which rolls back on failure. Every other caller omits the argument.
 scope_load_manifest() {
   # NB: separate `local` statements — `local a=$1 b=$a` expands $a against the
   # OUTER scope (before the local assignment lands), which breaks under set -u
   # when a caller invokes this without an ambient $keyvault.
   local keyvault="$1"
+  local pending="${2:-}"
   local p="$keyvault/$SCOPES_FILE_NAME"
   # Materialize the recipient list ONCE, checked. scope_read_recipients
   # failing inside a `< <(...)` or `| pipe` is invisible to the consumer, so
@@ -188,6 +198,11 @@ scope_load_manifest() {
   # assignment is where that failure becomes fatal for every scope operation.
   local rcp
   rcp="$(scope_read_recipients "$keyvault")" || return 1
+  if [ -n "$pending" ]; then
+    # awk -v (not a regex) — the name has been validated by the caller, but
+    # keep the match literal regardless.
+    rcp="$(printf '%s\n' "$rcp" | awk -F'\t' -v m="$pending" '$1 != m')"
+  fi
   if [ -f "$p" ]; then
     # Fail closed on a malformed manifest: bad YAML, a missing/renamed
     # `recipients:` key, a value that isn't "all"/a path list, or a path that
@@ -229,10 +244,12 @@ scope_load_manifest() {
     # ...and the reverse: a manifest entry with no recipients/<m>.age.pub is
     # a stale or typo'd machine name. Rejecting it here (rather than letting
     # it ride along as a scope for a key that does not exist) keeps the
-    # manifest and the recipient files describing the SAME machine set.
+    # manifest and the recipient files describing the SAME machine set. The
+    # pending machine is exempt: its pubkey is the very thing add-recipient
+    # is about to write.
     local unknown
-    unknown="$(printf '%s' "$json" | jq -r --argjson have "$names_json" \
-      '((.recipients | keys) - $have) | join(", ")')"
+    unknown="$(printf '%s' "$json" | jq -r --argjson have "$names_json" --arg pending "$pending" \
+      '((.recipients | keys) - $have) - (if $pending == "" then [] else [$pending] end) | join(", ")')"
     if [ -n "$unknown" ]; then
       printf 'agentkeys: %s lists unregistered machine(s): %s — no recipients/<name>.age.pub; register with add-recipient or remove the entry\n' "$SCOPES_FILE_NAME" "$unknown" >&2
       return 1
