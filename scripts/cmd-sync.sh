@@ -87,6 +87,26 @@ export SOPS_AGE_KEY_FILE="$(age_key_file)"
 [ -f "$SOPS_AGE_KEY_FILE" ] || die "Age private key not found: $SOPS_AGE_KEY_FILE
 Generate one with: mkdir -p ~/.age && age-keygen -o ~/.age/key.txt && chmod 600 ~/.age/key.txt"
 
+# The per-file skip below (machine_can_decrypt) reads "my pubkey is not
+# among this file's recipients" as out-of-scope. That is only sound if this
+# machine's key IS a registered recipient at all: an unregistered key, or
+# an identity file whose '# public key:' line was stripped (sops decrypts
+# fine without it, but the pubkey can't be resolved), would skip EVERY file
+# and publish an OK state over an empty secrets dir — where the first
+# sops -d used to fail loudly. Fail up front instead, before staging exists.
+if ! my_pubkey="$(age_pubkey 2>/dev/null)" || [ -z "$my_pubkey" ]; then
+  SYNC_FAIL_REASON="cannot resolve this machine's age public key from $SOPS_AGE_KEY_FILE (missing '# public key:' line? regenerate or restore the identity file header)"
+  die "$SYNC_FAIL_REASON"
+fi
+if ! registered_recipients="$(scope_read_recipients "$keyvault")"; then
+  SYNC_FAIL_REASON="cannot enumerate $keyvault/recipients/ (unreadable or malformed pubkey file — see error above)"
+  die "$SYNC_FAIL_REASON"
+fi
+if ! printf '%s\n' "$registered_recipients" | cut -f2 | grep -qxF "$my_pubkey"; then
+  SYNC_FAIL_REASON="this machine's age key ($my_pubkey) is not a registered recipient of $keyvault — register it with: agentkeys add-recipient <machine-name>"
+  die "$SYNC_FAIL_REASON"
+fi
+
 # ---------- error reporting ----------
 
 last_known_good=""

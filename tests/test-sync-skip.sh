@@ -42,6 +42,27 @@ AGE_KEY_FILE="$FIXTURE_HOME/keys/core.txt" AGENTKEYS_KEYVAULT="$VAULT" \
   bash "$REPO/agentkeys" sync --no-pull --secrets-dir "$SECRETS2" >/dev/null 2>&1
 [ -f "$SECRETS2/agents/mojo.env" ] || { echo "FAIL: core should materialize mojo"; fail=1; }
 
+# The skip path must only engage for a key that IS a registered recipient:
+# an unregistered key (no vault file lists it) must fail the sync up front —
+# silently skipping everything would publish an OK state with an empty
+# secrets dir, where the first sops -d used to fail loudly.
+fixture_keygen stranger >/dev/null
+SECRETS3="$FIXTURE_HOME/.secrets-stranger"
+if AGE_KEY_FILE="$FIXTURE_HOME/keys/stranger.txt" AGENTKEYS_KEYVAULT="$VAULT" \
+  bash "$REPO/agentkeys" sync --no-pull --secrets-dir "$SECRETS3" >/dev/null 2>&1; then
+  echo "FAIL: sync with an unregistered key should die, not skip everything"; fail=1
+fi
+
+# ...same when the identity file's '# public key:' line was stripped: sops
+# itself can still decrypt with it, but the skip logic cannot resolve the
+# local pubkey, so every file would look out-of-scope. Fail loudly instead.
+sed '/^# public key:/d' "$FIXTURE_HOME/keys/edge.txt" > "$FIXTURE_HOME/keys/edge-stripped.txt"
+chmod 600 "$FIXTURE_HOME/keys/edge-stripped.txt"
+if AGE_KEY_FILE="$FIXTURE_HOME/keys/edge-stripped.txt" AGENTKEYS_KEYVAULT="$VAULT" \
+  bash "$REPO/agentkeys" sync --no-pull --secrets-dir "$SECRETS3" >/dev/null 2>&1; then
+  echo "FAIL: sync with an unresolvable local pubkey should die, not skip everything"; fail=1
+fi
+
 # A file with NO sops recipients at all is not "out of scope" — it is
 # plaintext sitting in the vault (an incident, not a scope decision). The
 # skip path must not mask it: sync keeps dying loudly, exactly as it did
