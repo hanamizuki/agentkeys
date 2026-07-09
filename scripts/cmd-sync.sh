@@ -147,6 +147,23 @@ decrypt_to_json() {
   sops -d "$f" | yq -o json '.'
 }
 
+# Handle a vault file this machine's key cannot decrypt (the Type loops call
+# this BEFORE any decrypt attempt — an out-of-scope file must never even be
+# fed to sops). Encrypted for other machines → expected under per-path
+# scope: log + count, caller continues. No sops recipients at all → that is
+# not scope, it is plaintext sitting in the vault — keep dying loudly on it,
+# exactly as sync always has.
+skipped_count=0
+skip_out_of_scope() {
+  local f="$1"
+  if ! yq -e '.sops.age[0].recipient' "$f" >/dev/null 2>&1; then
+    SYNC_FAIL_REASON="$f has no sops age recipients (plaintext in the vault?) — refusing"
+    die "$SYNC_FAIL_REASON"
+  fi
+  info "  Skipping ${f#"$keyvault"/} (out of this machine's scope)"
+  skipped_count=$((skipped_count+1))
+}
+
 # Normalize a name to env-var-safe upper-snake (e.g. "foo-bar" -> "FOO_BAR").
 # Uses printf (not echo) so there's no trailing newline for the second tr to
 # transliterate into a stray underscore.
@@ -317,6 +334,9 @@ if [ ${#shared_yamls[@]} -gt 0 ]; then
   mkdir -p "$staging/shared"
   for f in "${shared_yamls[@]}"; do
     name="$(basename "$f" .yaml)"
+    if ! machine_can_decrypt "$f"; then
+      skip_out_of_scope "$f"; continue
+    fi
     if ! json="$(decrypt_to_json "$f")"; then
       SYNC_FAIL_REASON="failed to decrypt $f"
       die "$SYNC_FAIL_REASON"
@@ -362,6 +382,9 @@ service_token_files_written=0
 
 for f in "${service_yamls[@]}"; do
   svc="$(basename "$f" .yaml)"
+  if ! machine_can_decrypt "$f"; then
+    skip_out_of_scope "$f"; continue
+  fi
   validate_path_component "$svc" "services/ filename"
   # Service name flows into Type B injection as `<SVC_UPPER>_AUTH_*`. After
   # normalize, the prefix must be a valid env-var start (letter/underscore),
@@ -427,6 +450,9 @@ if [ ${#agent_yamls[@]} -gt 0 ]; then
   mkdir -p "$staging/agents"
   for f in "${agent_yamls[@]}"; do
     consumer="$(basename "$f" .yaml)"
+    if ! machine_can_decrypt "$f"; then
+      skip_out_of_scope "$f"; continue
+    fi
     if ! agent_json="$(decrypt_to_json "$f")"; then
       SYNC_FAIL_REASON="failed to decrypt $f"; die "$SYNC_FAIL_REASON"
     fi
@@ -486,6 +512,9 @@ fi
 type_c_files_written=0
 
 for f in "${file_manifests[@]}"; do
+  if ! machine_can_decrypt "$f"; then
+    skip_out_of_scope "$f"; continue
+  fi
   if ! json="$(decrypt_to_json "$f")"; then
     SYNC_FAIL_REASON="failed to decrypt $f"; die "$SYNC_FAIL_REASON"
   fi
@@ -559,7 +588,8 @@ cat > "$secrets_dir/.sync-state" <<EOF
     "shared": $shared_files_written,
     "service_tokens": $service_token_files_written,
     "agents": $agent_files_written,
-    "type_c_files": $type_c_files_written
+    "type_c_files": $type_c_files_written,
+    "skipped": $skipped_count
   },
   "status": "ok"
 }
@@ -572,4 +602,5 @@ info "  shared/<name>.env       : $shared_files_written"
 info "  agents/<name>.env       : $agent_files_written"
 info "  <svc>/<consumer>.token  : $service_token_files_written"
 info "  Type C files            : $type_c_files_written"
+info "  Skipped (out of scope)  : $skipped_count"
 info "  Output                  : $secrets_dir"

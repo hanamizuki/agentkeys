@@ -135,6 +135,17 @@ age_pubkey() {
   grep "^# public key:" "$key_file" | sed 's/^# public key: //'
 }
 
+# Return 0 if this machine's age pubkey is listed among a sops-encrypted
+# file's recipients (i.e. we're expected to decrypt it). Used by sync to skip
+# out-of-scope files instead of dying on them. Reads the file's own sops.age
+# metadata (its CURRENT encrypted state), not .sops.yaml (future rules).
+machine_can_decrypt() {
+  local f="$1" mypub
+  [ -f "$(age_key_file)" ] || return 1
+  mypub="$(age_pubkey)" || return 1
+  yq '.sops.age[].recipient' "$f" 2>/dev/null | grep -qxF "$mypub"
+}
+
 # ---------- Confirmation prompt ----------
 
 confirm() {
