@@ -108,16 +108,31 @@ scope_manifest_set_machine() {
 }
 
 # recipients/<machine>.age.pub → "machine<TAB>pubkey" (unsorted; callers that
-# need order pipe to `LC_ALL=C sort`).
+# need order pipe to `LC_ALL=C sort`). Fails closed on an unreadable or
+# malformed pubkey file: silently skipping one used to drop that machine from
+# every generated rule, so the next updatekeys pass silently REVOKED its
+# access. NB: a non-zero status here is invisible to callers reading through
+# a process substitution — scope_load_manifest (the single validation gate)
+# materializes this list once, checked, before any consumer iterates it.
 scope_read_recipients() {
   local keyvault="$1" f name pub
+  local -a _rr_files=()
   shopt -s nullglob
-  for f in "$keyvault"/recipients/*.age.pub; do
-    name="$(basename "$f" .age.pub)"
-    pub="$(grep -E '^age1' "$f" | head -1 || true)"
-    [ -n "$pub" ] && printf '%s\t%s\n' "$name" "$pub"
-  done
+  _rr_files=( "$keyvault"/recipients/*.age.pub )
   shopt -u nullglob
+  for f in "${_rr_files[@]}"; do
+    name="$(basename "$f" .age.pub)"
+    if [ ! -r "$f" ]; then
+      printf 'agentkeys: cannot read %s — fix its permissions (a skipped pubkey would silently revoke that machine)\n' "$f" >&2
+      return 1
+    fi
+    pub="$(grep -E '^age1' "$f" | head -1)" || true
+    if [ -z "$pub" ]; then
+      printf 'agentkeys: %s contains no age1 public key line\n' "$f" >&2
+      return 1
+    fi
+    printf '%s\t%s\n' "$name" "$pub"
+  done
 }
 
 # Every encrypted-eligible yaml in the vault as a vault-relative path, sorted.
@@ -127,7 +142,19 @@ scope_read_recipients() {
 # revoked recipient still able to decrypt such a file. Excludes the CLI-managed
 # metadata files and recipients/ pubkeys, which are never sops-encrypted.
 scope_list_encrypted_files() {
-  local keyvault="$1" f
+  local keyvault="$1" f tmp
+  tmp="$(mktemp)" || return 1
+  # find's status must be CHECKED: with stderr discarded and the old
+  # pipeline swallowing the exit code, a traversal failure (an unreadable
+  # subdirectory) produced a silently INCOMPLETE list — fail-open, since
+  # files missing from it skip re-encryption on a scope change, leaving a
+  # revoked key able to decrypt them.
+  if ! find "$keyvault" -type f -name '*.yaml' -not -path '*/.git/*' > "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    printf 'agentkeys: could not fully scan %s for vault files (unreadable subdirectory?)\n' "$keyvault" >&2
+    return 1
+  fi
+  LC_ALL=C sort -o "$tmp" "$tmp" || { rm -f "$tmp"; return 1; }
   while IFS= read -r f; do
     f="${f#"$keyvault"/}"
     case "$f" in
@@ -140,7 +167,10 @@ scope_list_encrypted_files() {
     # a git work tree check-ignore exits 128 → nothing is filtered.
     if git -C "$keyvault" check-ignore -q "$f" 2>/dev/null; then continue; fi
     printf '%s\n' "$f"
-  done < <(find "$keyvault" -type f -name '*.yaml' -not -path '*/.git/*' 2>/dev/null | LC_ALL=C sort)
+  done < "$tmp"
+  rm -f "$tmp"
+  # The loop's last check-ignore may exit non-zero — that's filtering, not
+  # failure; keep the function's status clean for set -e callers.
   return 0
 }
 
@@ -152,6 +182,12 @@ scope_load_manifest() {
   # when a caller invokes this without an ambient $keyvault.
   local keyvault="$1"
   local p="$keyvault/$SCOPES_FILE_NAME"
+  # Materialize the recipient list ONCE, checked. scope_read_recipients
+  # failing inside a `< <(...)` or `| pipe` is invisible to the consumer, so
+  # an unreadable pubkey used to shrink the machine list silently — this
+  # assignment is where that failure becomes fatal for every scope operation.
+  local rcp
+  rcp="$(scope_read_recipients "$keyvault")" || return 1
   if [ -f "$p" ]; then
     # Fail closed on a malformed manifest: bad YAML, a missing/renamed
     # `recipients:` key, a value that isn't "all"/a path list, or a path that
@@ -181,21 +217,60 @@ scope_load_manifest() {
     # regen would re-encrypt the whole vault to its key (a hand edit or merge
     # that loses a line must not turn into a grant-all). Only a MISSING
     # manifest file synthesizes all-"all" (legacy-vault upgrade, below).
-    local missing
-    missing="$(scope_read_recipients "$keyvault" | cut -f1 | LC_ALL=C sort | jq -R -s \
-      --argjson have "$(printf '%s' "$json" | jq '.recipients | keys')" \
-      -r 'split("\n") | map(select(length > 0)) | . - $have | join(", ")')"
+    local names_json missing
+    names_json="$(printf '%s\n' "$rcp" | cut -f1 | LC_ALL=C sort | jq -R -s \
+      'split("\n") | map(select(length > 0))')"
+    missing="$(printf '%s' "$json" | jq -r --argjson have "$names_json" \
+      '($have - (.recipients | keys)) | join(", ")')"
     if [ -n "$missing" ]; then
       printf 'agentkeys: %s omits registered recipient(s): %s — list each machine explicitly, or delete the file to reset every machine to "all"\n' "$SCOPES_FILE_NAME" "$missing" >&2
       return 1
     fi
-    # Reject scope paths git ignores (init ignores secrets/, .secrets/): an
-    # ignored file is never committed or synced, so it is not a vault secret
-    # — and updatekeys-then-git-add on one would abort AFTER re-keying it.
-    # Outside a git work tree check-ignore exits 128 → nothing is rejected.
+    # ...and the reverse: a manifest entry with no recipients/<m>.age.pub is
+    # a stale or typo'd machine name. Rejecting it here (rather than letting
+    # it ride along as a scope for a key that does not exist) keeps the
+    # manifest and the recipient files describing the SAME machine set.
+    local unknown
+    unknown="$(printf '%s' "$json" | jq -r --argjson have "$names_json" \
+      '((.recipients | keys) - $have) | join(", ")')"
+    if [ -n "$unknown" ]; then
+      printf 'agentkeys: %s lists unregistered machine(s): %s — no recipients/<name>.age.pub; register with add-recipient or remove the entry\n' "$SCOPES_FILE_NAME" "$unknown" >&2
+      return 1
+    fi
+    # One pubkey registered under several machine names is a benign alias
+    # ONLY while their scopes agree: scope is machine-name keyed but decrypt
+    # capability is KEY-level — every rule listing either name carries the
+    # same key, so a divergence would let the wider scope silently win for
+    # both. (Runs after the two set checks above, so every name in $rcp is
+    # known to have a manifest entry.)
+    local _dn _dp _ds
+    local -A _pub_owner=() _pub_scope=()
+    while IFS=$'\t' read -r _dn _dp; do
+      [ -n "$_dn" ] || continue
+      _ds="$(printf '%s' "$json" | jq -c --arg m "$_dn" \
+        '.recipients[$m] | if type == "array" then sort else . end')"
+      if [ -n "${_pub_owner[$_dp]+set}" ] && [ "${_pub_scope[$_dp]}" != "$_ds" ]; then
+        printf 'agentkeys: %s and %s share one age pubkey but have different scopes — decrypt capability is key-level, so the wider scope would win for both; give them identical scopes or distinct keys\n' "${_pub_owner[$_dp]}" "$_dn" >&2
+        return 1
+      fi
+      _pub_owner[$_dp]="$_dn"; _pub_scope[$_dp]="$_ds"
+    done <<< "$rcp"
+    # Reject scope paths that are not vault secrets. Two families:
+    #  - the CLI-managed metadata files (same exclusions as the file scan) —
+    #    they are never sops-encrypted, and ruling one would feed it to
+    #    updatekeys as if it were a secret;
+    #  - paths git ignores (init ignores secrets/, .secrets/): an ignored
+    #    file is never committed or synced — and updatekeys-then-git-add on
+    #    one would abort AFTER re-keying it. Outside a git work tree
+    #    check-ignore exits 128 → nothing is rejected.
     local ip
     while IFS= read -r ip; do
       [ -n "$ip" ] || continue
+      case "$ip" in
+        .sops.yaml|"$SCOPES_FILE_NAME"|recipients/*)
+          printf 'agentkeys: %s lists CLI-managed metadata path %s — these are never encrypted and cannot be scoped\n' "$SCOPES_FILE_NAME" "$ip" >&2
+          return 1 ;;
+      esac
       if git -C "$keyvault" check-ignore -q "$ip" 2>/dev/null; then
         printf 'agentkeys: %s lists gitignored path %s — ignored files are not vault secrets\n' "$SCOPES_FILE_NAME" "$ip" >&2
         return 1
@@ -208,7 +283,7 @@ scope_load_manifest() {
   while IFS=$'\t' read -r name pub; do
     [ -n "$name" ] || continue
     obj="$(printf '%s' "$obj" | jq --arg m "$name" '.recipients[$m]="all"')"
-  done < <(scope_read_recipients "$keyvault" | LC_ALL=C sort)
+  done < <(printf '%s\n' "$rcp" | LC_ALL=C sort)
   printf '%s' "$obj"
 }
 
@@ -251,9 +326,15 @@ _scope_begin() {
   SCOPE_COMMITTED=0
   SCOPE_SNAP_VAULT="$keyvault"
   SCOPE_SNAP_DIR="$(mktemp -d)"
-  local f
+  local f listed
+  # Checked, not inline in the group below (a producer failing there is
+  # swallowed): a snapshot missing files could not restore them on rollback.
+  # Nothing has been mutated yet, so die here is safe — READY stays 0 and
+  # the EXIT trap just drops the empty snapshot without restoring.
+  listed="$(scope_list_encrypted_files "$keyvault")" \
+    || die "Could not enumerate the vault's files — aborting before any change."
   { printf '%s\n' ".sops.yaml" "$SCOPES_FILE_NAME" "$@"
-    scope_list_encrypted_files "$keyvault"
+    if [ -n "$listed" ]; then printf '%s\n' "$listed"; fi
   } | LC_ALL=C sort -u > "$SCOPE_SNAP_DIR/paths"
   while IFS= read -r f; do
     [ -f "$keyvault/$f" ] || continue
@@ -442,9 +523,14 @@ scope_apply() {
 # is what prevents .sops.yaml claiming a grant/revocation that never reached
 # the file's real recipients.
 scope_all_ruled_paths() {
-  local keyvault="$1" mj
+  local keyvault="$1" mj files
   mj="$(scope_load_manifest "$keyvault")" || return 1
-  { scope_list_encrypted_files "$keyvault"
+  # Checked assignment, NOT inline in the brace group below: a producer
+  # failing inside `{ ...; } | sort` is invisible (the group's status is its
+  # last command's), so an incomplete file scan would silently narrow the
+  # ruled set — the exact fail-open this function exists to prevent.
+  files="$(scope_list_encrypted_files "$keyvault")" || return 1
+  { if [ -n "$files" ]; then printf '%s\n' "$files"; fi
     printf '%s' "$mj" | jq -r '.recipients[] | select(type=="array") | .[]'
   } | LC_ALL=C sort -u
 }
@@ -460,6 +546,12 @@ emit_sops_rules() {
     [ -n "$name" ] || continue
     machines+=("$name"); PUB[$name]="$pub"
   done < <(scope_read_recipients "$keyvault" | LC_ALL=C sort)
+
+  # Checked materialization — scope_all_ruled_paths failing inside a process
+  # substitution would be invisible, and a truncated path list here means
+  # rules silently missing from .sops.yaml.
+  local ruled
+  ruled="$(scope_all_ruled_paths "$keyvault")" || return 1
 
   local -A FILES_GROUP=() OTHER_GROUP=()
   local path
@@ -482,7 +574,7 @@ emit_sops_rules() {
       files/*) FILES_GROUP[$csv]="${FILES_GROUP[$csv]:+${FILES_GROUP[$csv]}|}$atom" ;;
       *)       OTHER_GROUP[$csv]="${OTHER_GROUP[$csv]:+${OTHER_GROUP[$csv]}|}$atom" ;;
     esac
-  done < <(scope_all_ruled_paths "$keyvault")
+  done <<< "$ruled"
 
   cat <<'HDR'
 # .sops.yaml — encryption rules for this keyvault repo
