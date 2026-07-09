@@ -74,4 +74,20 @@ if AGE_KEY_FILE="$FIXTURE_HOME/keys/core.txt" AGENTKEYS_KEYVAULT="$VAULT" \
 fi
 rm -f "$VAULT/agents/plain.yaml"
 
+# The registration check must read the POST-pull vault state: the normal
+# onboarding path registers a machine upstream, then that machine runs
+# `agentkeys sync` to pull its own registration down. Validating against the
+# stale pre-pull clone would dead-end exactly that path.
+CLONE="$FIXTURE_HOME/clone"
+git clone -q "$VAULT" "$CLONE"
+NEWBIE="$(fixture_keygen newbie)"
+AGENTKEYS_KEYVAULT="$VAULT" bash "$REPO/agentkeys" add-recipient newbie "$NEWBIE" >/dev/null 2>&1 \
+  || { echo "FAIL: add-recipient newbie errored"; fail=1; }
+SECRETS4="$FIXTURE_HOME/.secrets-newbie"
+if ! AGE_KEY_FILE="$FIXTURE_HOME/keys/newbie.txt" AGENTKEYS_KEYVAULT="$CLONE" \
+  bash "$REPO/agentkeys" sync --secrets-dir "$SECRETS4" >/dev/null 2>&1; then
+  echo "FAIL: sync from a stale clone should pull the registration first, not die"; fail=1
+fi
+[ -f "$SECRETS4/agents/boba.env" ] || { echo "FAIL: newbie should materialize after pulling its registration"; fail=1; }
+
 [ "$fail" -eq 0 ] && echo "PASS: sync-skip" || exit 1
